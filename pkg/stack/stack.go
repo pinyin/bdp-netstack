@@ -17,6 +17,7 @@ import (
 	"github.com/pinyin/bdp-netstack/pkg/nat"
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
 	"github.com/pinyin/bdp-netstack/pkg/udp"
+	"github.com/pinyin/bdp-netstack/pkg/udpnat"
 )
 
 // Config holds all configuration for the network stack.
@@ -65,6 +66,9 @@ type Stack struct {
 	// ICMP forwarding (VM → external hosts)
 	icmpFwd *icmp.Forwarder
 
+	// UDP NAT (VM → external hosts)
+	udpNAT *udpnat.Table
+
 	// Stats
 	bytesIn  uint64
 	bytesOut uint64
@@ -80,6 +84,7 @@ func New(cfg Config, tcpState *tcp.TCPState) *Stack {
 		tcpState: tcpState,
 		udpMux:   udp.NewMux(),
 		natTable: nat.NewTable(),
+		udpNAT:   udpnat.NewTable(),
 	}
 
 	// Set up DHCP server
@@ -182,46 +187,60 @@ func (s *Stack) deliberate(now time.Time) {
 	// Phase 3: NAT — poll host connections (non-blocking reads → VM send buffers)
 	s.natTable.Poll()
 
-	// Phase 4: TCP layer deliberation (batch-process all connections)
+	// Phase 4: UDP NAT — poll host UDP sockets (non-blocking reads → ingress queue)
+	s.udpNAT.Poll()
+
+	// Phase 5: TCP layer deliberation (batch-process all connections)
 	s.tcpState.Deliberate(now)
 
-	// Phase 5: ICMP forwarder — read host echo replies
+	// Phase 6: ICMP forwarder — read host echo replies
 	if s.icmpFwd != nil {
 		s.icmpFwd.Poll()
 	}
 
-	// Phase 6: Forwarder — proxy VM receive buffers to host
+	// Phase 7: Forwarder — proxy VM receive buffers to host
 	if s.fwd != nil {
 		s.fwd.ProxyVMToHost()
 	}
 
-	// Phase 6: NAT — proxy VM receive buffers to host connections
+	// Phase 8: NAT — proxy VM receive buffers to host connections
 	s.natTable.ProxyVMToHost()
 
-	// Phase 7: Write outgoing TCP segments
+	// Phase 9: UDP NAT — write queued VM datagrams to host sockets
+	s.udpNAT.FlushEgress()
+
+	// Phase 10: Write outgoing TCP segments
 	for _, seg := range s.tcpState.ConsumeOutputs() {
 		s.sendSegment(seg)
 	}
 
-	// Phase 9: Write outgoing UDP datagrams
+	// Phase 11: Write outgoing UDP datagrams
 	for _, dg := range s.udpMux.ConsumeOutputs() {
 		s.sendDatagram(dg)
 	}
 
-	// Phase 10: Write ICMP replies to VM
+	// Phase 12: Write ICMP replies to VM
 	if s.icmpFwd != nil {
 		for _, reply := range s.icmpFwd.ConsumeReplies() {
 			s.sendICMPReply(reply)
 		}
 	}
 
-	// Phase 11: Forwarder cleanup
+	// Phase 13: UDP NAT — deliver host responses to VM
+	for _, dg := range s.udpNAT.DeliverToVM() {
+		s.sendDatagram(dg)
+	}
+
+	// Phase 14: Forwarder cleanup
 	if s.fwd != nil {
 		s.fwd.Cleanup()
 	}
 
-	// Phase 12: NAT cleanup
+	// Phase 15: NAT cleanup
 	s.natTable.Cleanup()
+
+	// Phase 16: UDP NAT cleanup
+	s.udpNAT.Cleanup(now)
 }
 
 // sendICMPReply writes an ICMP Echo Reply back to the VM.
@@ -314,6 +333,12 @@ func (s *Stack) processIPv4(frame *ether.Frame) {
 		return
 	}
 
+	// UDP to external IPs → UDP NAT
+	if pkt.Protocol == ipv4.ProtocolUDP && !pkt.IsForUs(s.cfg.GatewayIP) {
+		s.processUDPNAT(frame, pkt)
+		return
+	}
+
 	if !pkt.IsForUs(s.cfg.GatewayIP) {
 		return
 	}
@@ -379,6 +404,24 @@ func (s *Stack) processICMPForward(frame *ether.Frame, pkt *ipv4.Packet) {
 	if err := s.icmpFwd.Forward(pkt.SrcIP, pkt.DstIP, id, seq, icmpPkt.Payload); err != nil {
 		log.Printf("ICMP fwd error: %v", err)
 	}
+}
+
+// processUDPNAT forwards UDP datagrams to external hosts via UDP NAT.
+func (s *Stack) processUDPNAT(frame *ether.Frame, pkt *ipv4.Packet) {
+	hdr, payload, err := udp.ParseUDP(pkt.Payload)
+	if err != nil {
+		return
+	}
+
+	dg := &udp.UDPDatagram{
+		SrcIP:   pkt.SrcIP,
+		DstIP:   pkt.DstIP,
+		SrcPort: hdr.SrcPort,
+		DstPort: hdr.DstPort,
+		Payload: payload,
+	}
+
+	s.udpNAT.Intercept(dg)
 }
 
 // processTCP processes one incoming TCP segment.

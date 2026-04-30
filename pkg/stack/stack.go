@@ -12,6 +12,7 @@ import (
 	"github.com/pinyin/bdp-netstack/pkg/dns"
 	"github.com/pinyin/bdp-netstack/pkg/ether"
 	"github.com/pinyin/bdp-netstack/pkg/fwd"
+	"github.com/pinyin/bdp-netstack/pkg/icmp"
 	"github.com/pinyin/bdp-netstack/pkg/ipv4"
 	"github.com/pinyin/bdp-netstack/pkg/nat"
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
@@ -61,6 +62,9 @@ type Stack struct {
 	// Port forwarding
 	fwd *fwd.Forwarder
 
+	// ICMP forwarding (VM → external hosts)
+	icmpFwd *icmp.Forwarder
+
 	// Stats
 	bytesIn  uint64
 	bytesOut uint64
@@ -102,6 +106,13 @@ func New(cfg Config, tcpState *tcp.TCPState) *Stack {
 		if err != nil {
 			log.Printf("port forwarding setup failed: %v", err)
 		}
+	}
+
+	// Set up ICMP forwarder (non-privileged, works in sandbox)
+	var err error
+	s.icmpFwd, err = icmp.New()
+	if err != nil {
+		log.Printf("ICMP forwarder: %v (VM-to-external ping will not work)", err)
 	}
 
 	// ARP: statically map gateway IP to our MAC
@@ -174,7 +185,12 @@ func (s *Stack) deliberate(now time.Time) {
 	// Phase 4: TCP layer deliberation (batch-process all connections)
 	s.tcpState.Deliberate(now)
 
-	// Phase 5: Forwarder — proxy VM receive buffers to host
+	// Phase 5: ICMP forwarder — read host echo replies
+	if s.icmpFwd != nil {
+		s.icmpFwd.Poll()
+	}
+
+	// Phase 6: Forwarder — proxy VM receive buffers to host
 	if s.fwd != nil {
 		s.fwd.ProxyVMToHost()
 	}
@@ -187,18 +203,50 @@ func (s *Stack) deliberate(now time.Time) {
 		s.sendSegment(seg)
 	}
 
-	// Phase 8: Write outgoing UDP datagrams
+	// Phase 9: Write outgoing UDP datagrams
 	for _, dg := range s.udpMux.ConsumeOutputs() {
 		s.sendDatagram(dg)
 	}
 
-	// Phase 9: Forwarder cleanup
+	// Phase 10: Write ICMP replies to VM
+	if s.icmpFwd != nil {
+		for _, reply := range s.icmpFwd.ConsumeReplies() {
+			s.sendICMPReply(reply)
+		}
+	}
+
+	// Phase 11: Forwarder cleanup
 	if s.fwd != nil {
 		s.fwd.Cleanup()
 	}
 
-	// Phase 10: NAT cleanup
+	// Phase 12: NAT cleanup
 	s.natTable.Cleanup()
+}
+
+// sendICMPReply writes an ICMP Echo Reply back to the VM.
+func (s *Stack) sendICMPReply(reply icmp.Reply) {
+	dstMAC, ok := s.arp.Lookup(reply.DstIP)
+	if !ok {
+		log.Printf("ICMP reply: no ARP entry for %s", reply.DstIP)
+		return
+	}
+
+	icmpData := icmp.BuildICMPReplyData(reply.ID, reply.Seq, reply.Payload)
+
+	ipPkt := &ipv4.Packet{
+		Version:  4,
+		IHL:      20,
+		TOS:      0,
+		ID:       0,
+		TTL:      64,
+		Protocol: ipv4.ProtocolICMP,
+		SrcIP:    reply.SrcIP,
+		DstIP:    reply.DstIP,
+		Payload:  icmpData,
+	}
+
+	s.writeIPv4Packet(dstMAC, ipPkt)
 }
 
 // processFrame processes one incoming Ethernet frame.
@@ -260,6 +308,12 @@ func (s *Stack) processIPv4(frame *ether.Frame) {
 		return
 	}
 
+	// ICMP to external IPs → forwarder
+	if pkt.Protocol == ipv4.ProtocolICMP && !pkt.IsForUs(s.cfg.GatewayIP) {
+		s.processICMPForward(frame, pkt)
+		return
+	}
+
 	if !pkt.IsForUs(s.cfg.GatewayIP) {
 		return
 	}
@@ -302,6 +356,29 @@ func (s *Stack) processICMP(frame *ether.Frame, pkt *ipv4.Packet) {
 
 	log.Printf("ICMP: Echo Reply from %s to %s via %s", ipReply.SrcIP, ipReply.DstIP, frame.SrcMAC)
 	s.writeIPv4Packet(frame.SrcMAC, ipReply)
+}
+
+// processICMPForward forwards ICMP Echo Requests to external hosts.
+func (s *Stack) processICMPForward(frame *ether.Frame, pkt *ipv4.Packet) {
+	if s.icmpFwd == nil {
+		return
+	}
+
+	icmpPkt, err := ipv4.ParseICMP(pkt.Payload)
+	if err != nil {
+		return
+	}
+	if icmpPkt.Type != ipv4.ICMPTypeEchoRequest {
+		return
+	}
+
+	id := uint16(icmpPkt.RestHdr >> 16)
+	seq := uint16(icmpPkt.RestHdr & 0xFFFF)
+
+	log.Printf("ICMP fwd: %s → %s (id=%d, seq=%d)", pkt.SrcIP, pkt.DstIP, id, seq)
+	if err := s.icmpFwd.Forward(pkt.SrcIP, pkt.DstIP, id, seq, icmpPkt.Payload); err != nil {
+		log.Printf("ICMP fwd error: %v", err)
+	}
 }
 
 // processTCP processes one incoming TCP segment.

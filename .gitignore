@@ -1,0 +1,17 @@
+# Build output
+/cmd/bdp-netstack/bdp-netstack
+/build/
+
+# Test artifacts
+/test/image/output/
+
+# OS files
+.DS_Store
+._*
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

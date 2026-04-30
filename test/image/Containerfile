@@ -1,0 +1,77 @@
+# Minimal test image for bdp-netstack e2e testing
+# Based on Fedora bootc minimal — much smaller than FCOS.
+#
+# Build:
+#   ./image/build.sh
+#   (runs on Linux with podman + bootc-image-builder)
+#
+# Use:
+#   vfkit --bootloader efi,create ... --device virtio-blk,path=disk.raw
+#
+# SSH:  root@<ip> with test_image/test_key
+
+FROM quay.io/bootc-devel/fedora-bootc-43-minimal
+
+# Install test requirements
+RUN dnf -y install \
+    openssh-server \
+    dhcp-client \
+    iproute \
+    iputils \
+    socat \
+    tcpdump \
+    ca-certificates \
+    bootupd \
+    systemd-boot \
+    NetworkManager && \
+    dnf clean all && \
+    ln -sf /usr/libexec/bootupd /usr/bin/bootupd
+
+# Clean up unnecessary files to reduce image size
+RUN rm -rf \
+    /usr/share/locale/* \
+    /usr/share/man/* \
+    /usr/share/doc/* \
+    /usr/share/info/* \
+    /var/cache/dnf/* \
+    /var/lib/dnf/history* \
+    /var/log/dnf* \
+    /var/log/lastlog && \
+    mkdir -p /usr/share/locale/en_US.UTF-8
+
+# Enable SSH and networking
+RUN systemctl enable sshd && \
+    systemctl enable NetworkManager
+
+# Allow root SSH login with key only
+RUN sed -i 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \
+    sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# Inject test SSH public key
+# /root may exist as a file in the base image — fix it first
+RUN rm -rf /root && mkdir -p /root/.ssh && chmod 700 /root/.ssh
+COPY test_key.pub /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+# Disable systemd-resolved so DNS goes through the gateway
+RUN systemctl mask systemd-resolved && \
+    rm -f /etc/resolv.conf && \
+    printf 'nameserver 192.168.65.1\n' > /etc/resolv.conf
+
+# Enable virtio console with autologin for debugging
+RUN systemctl enable serial-getty@hvc0.service && \
+    mkdir -p /etc/systemd/system/serial-getty@hvc0.service.d && \
+    printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root %%I $TERM\n' > /etc/systemd/system/serial-getty@hvc0.service.d/override.conf
+
+# Conservative boot optimization
+RUN systemctl mask systemd-homed systemd-userdbd systemd-oomd getty@tty1 auditd 2>/dev/null || true
+
+# Set SELinux to permissive
+RUN sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true
+
+# Validate bootc configuration
+RUN bootc container lint
+
+LABEL name="bdp-netstack-test"
+LABEL description="Minimal test image for bdp-netstack e2e testing"

@@ -1,0 +1,366 @@
+package tcp
+
+import (
+	"net"
+	"testing"
+	"time"
+)
+
+func TestHandshake(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+
+	ts := NewTCPState(cfg)
+
+	var accepted *Conn
+	ts.Listen(func(c *Conn) {
+		accepted = c
+	})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Step 1: VM sends SYN → should create SynRcvd entry
+	synSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1000, 0, FlagSYN, nil)
+	ts.InjectSegment(synSeg)
+	ts.Deliberate(time.Now())
+
+	if len(ts.SynRcvd) != 1 {
+		t.Fatalf("expected 1 SynRcvd connection, got %d", len(ts.SynRcvd))
+	}
+
+	// Should have generated a SYN-ACK
+	outputs := ts.ConsumeOutputs()
+	if len(outputs) == 0 {
+		t.Fatal("expected SYN-ACK output")
+	}
+	synAck := outputs[0]
+	if !synAck.Header.HasFlag(FlagSYN | FlagACK) {
+		t.Fatalf("expected SYN|ACK, got flags=%02x", synAck.Header.Flags)
+	}
+	if synAck.Header.AckNum != 1001 { // IRS + 1
+		t.Fatalf("expected ACK=1001, got %d", synAck.Header.AckNum)
+	}
+
+	// Step 2: VM sends ACK confirming SYN-ACK → should move to Established
+	ackSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, synAck.Header.SeqNum+1, FlagACK, nil)
+	ts.InjectSegment(ackSeg)
+	ts.Deliberate(time.Now())
+
+	if len(ts.SynRcvd) != 0 {
+		t.Fatalf("expected 0 SynRcvd, got %d", len(ts.SynRcvd))
+	}
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+	if conn == nil {
+		t.Fatal("expected connection in Established")
+	}
+
+	if accepted == nil {
+		t.Fatal("expected accept callback to be called")
+	}
+	if accepted != conn {
+		t.Fatal("accepted connection != established connection")
+	}
+
+	t.Logf("Handshake complete: %s", conn.Tuple)
+}
+
+func TestDataTransfer(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Complete handshake
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Send data from VM
+	payload := []byte("hello world")
+	dataSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, conn.ISS+1, FlagACK|FlagPSH, payload)
+	ts.InjectSegment(dataSeg)
+	ts.Deliberate(time.Now())
+
+	buf := make([]byte, 1024)
+	n := conn.ReadRecvBuf(buf)
+	if n != len(payload) {
+		t.Fatalf("expected %d bytes, got %d", len(payload), n)
+	}
+	if string(buf[:n]) != "hello world" {
+		t.Fatalf("expected 'hello world', got '%s'", string(buf[:n]))
+	}
+
+	// Delayed ACK defers one round — data was just received, so ACK waits
+	outputs := ts.ConsumeOutputs()
+	for _, out := range outputs {
+		if out.Header.HasFlag(FlagACK) && out.Header.AckNum == 1001+uint32(len(payload)) {
+			t.Fatal("ACK should be delayed by one round after data receipt")
+		}
+	}
+
+	// Next deliberation: DataRcvdThisRound cleared, ACK fires
+	ts.Deliberate(time.Now())
+	outputs = ts.ConsumeOutputs()
+	hasAck := false
+	for _, out := range outputs {
+		if out.Header.HasFlag(FlagACK) && out.Header.AckNum == 1001+uint32(len(payload)) {
+			hasAck = true
+		}
+	}
+	if !hasAck {
+		t.Fatal("expected ACK for received data")
+	}
+}
+
+func TestForwardCascade(t *testing.T) {
+	// Verify that a connection cascades through multiple states in one round.
+	// Active close path: ESTABLISHED → FIN_WAIT1 → FIN_WAIT2 (app closes first)
+	// Passive close path: ESTABLISHED → CLOSE_WAIT → LAST_ACK (peer FIN first)
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Test 1: Passive close cascade (peer FIN → CloseWait → (AppClose) → LastAck)
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Inject FIN from peer → should go to CloseWait
+	finSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, conn.ISS+1, FlagACK|FlagFIN, nil)
+	ts.InjectSegment(finSeg)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.CloseWait[conn.Tuple]; !ok {
+		t.Fatalf("expected connection in CloseWait after peer FIN. CloseWait=%d, Established=%d",
+			len(ts.CloseWait), len(ts.Established))
+	}
+
+	// Now AppClose + last ACK in same round: CloseWait → LastAck → cleanup
+	ts.AppClose(conn.Tuple)
+	ackOurFin := fakeSegment(vmIP, gwIP, 12345, 8080, 1002, conn.ISS+2, FlagACK, nil)
+	ts.InjectSegment(ackOurFin)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.LastAck[conn.Tuple]; ok {
+		t.Fatal("expected connection cleaned up from LastAck after ACK of our FIN")
+	}
+	if ts.ConnectionCount() != 0 {
+		t.Fatalf("expected 0 connections after cleanup, got %d", ts.ConnectionCount())
+	}
+
+	// Consume leftover outputs from test 1 to avoid contaminating test 2's handshake
+	ts.ConsumeOutputs()
+
+	// Test 2: Active close cascade (app close → FinWait1, then ACK → FinWait2)
+	doHandshake(t, ts, vmIP, gwIP, 12346, 8080)
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Round 1: AppClose moves to FinWait1, advanceFinWait1 sends FIN
+	ts.AppClose(conn.Tuple)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.FinWait1[conn.Tuple]; !ok {
+		t.Fatalf("expected connection in FinWait1 after AppClose. FinWait1=%d, Established=%d",
+			len(ts.FinWait1), len(ts.Established))
+	}
+
+	// Round 2: VM ACKs our FIN → FinWait2
+	ackFin := fakeSegment(vmIP, gwIP, 12346, 8080, 1001, conn.ISS+2, FlagACK, nil)
+	ts.InjectSegment(ackFin)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.FinWait2[conn.Tuple]; !ok {
+		t.Fatalf("expected connection in FinWait2 after FIN ACK. FinWait1=%d, FinWait2=%d",
+			len(ts.FinWait1), len(ts.FinWait2))
+	}
+}
+
+func TestStateAsPosition(t *testing.T) {
+	// Verify that a connection's state IS its collection membership
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Handshake
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	// Verify the conn is only in Established, not in any other collection
+	if ts.ConnectionCount() != 1 {
+		t.Fatalf("expected 1 total connection, got %d", ts.ConnectionCount())
+	}
+	if len(ts.Established) != 1 {
+		t.Fatalf("expected 1 in Established, got %d", len(ts.Established))
+	}
+	if len(ts.SynRcvd) != 0 {
+		t.Fatal("conn should NOT be in SynRcvd")
+	}
+	if len(ts.FinWait1) != 0 {
+		t.Fatal("conn should NOT be in FinWait1")
+	}
+
+	// The connection has no State field to read — its state is purely positional
+}
+
+func TestActiveOpen(t *testing.T) {
+	// Test that ActiveOpen creates a conn in SynSent, sends SYN,
+	// and on SYN-ACK reply transitions to Established.
+	cfg := DefaultConfig()
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+
+	gwIP := net.ParseIP("192.168.65.1")
+	vmIP := net.ParseIP("192.168.65.2")
+
+	// Active open: GW initiates connection to VM port 22
+	tuple := NewTuple(gwIP, vmIP, 32768, 22)
+	conn := ts.ActiveOpen(tuple, 65535)
+
+	if conn == nil {
+		t.Fatal("ActiveOpen returned nil")
+	}
+	if len(ts.SynSent) != 1 {
+		t.Fatalf("expected 1 SynSent, got %d", len(ts.SynSent))
+	}
+
+	// Deliberate should trigger SYN send
+	ts.Deliberate(time.Now())
+	outputs := ts.ConsumeOutputs()
+
+	if len(outputs) == 0 {
+		t.Fatal("expected SYN output")
+	}
+	syn := outputs[0]
+	if !syn.Header.HasFlag(FlagSYN) || syn.Header.HasFlag(FlagACK) {
+		t.Fatalf("expected pure SYN, got flags=%02x", syn.Header.Flags)
+	}
+	if syn.Header.SeqNum != conn.ISS {
+		t.Fatalf("expected SYN seq=%d, got %d", conn.ISS, syn.Header.SeqNum)
+	}
+
+	// VM responds with SYN-ACK
+	synAckSeg := fakeSegment(vmIP, gwIP, 22, 32768, 5000, conn.ISS+1, FlagSYN|FlagACK, nil)
+	ts.InjectSegment(synAckSeg)
+	ts.Deliberate(time.Now())
+
+	// Connection should now be in Established
+	if len(ts.SynSent) != 0 {
+		t.Fatalf("expected 0 SynSent, got %d", len(ts.SynSent))
+	}
+	if _, ok := ts.Established[tuple]; !ok {
+		t.Fatal("expected connection in Established")
+	}
+
+	// Should have sent ACK for SYN-ACK
+	outputs = ts.ConsumeOutputs()
+	hasAck := false
+	for _, out := range outputs {
+		if out.Header.HasFlag(FlagACK) && out.Header.AckNum == 5001 {
+			hasAck = true
+		}
+	}
+	if !hasAck {
+		t.Fatal("expected ACK for SYN-ACK")
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	cfg.IdleTimeout = 100 * time.Millisecond
+
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Establish a connection
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	if ts.ConnectionCount() != 1 {
+		t.Fatalf("expected 1 connection, got %d", ts.ConnectionCount())
+	}
+
+	// Advance tick past idle timeout (10ms per slot, so 100ms = 10 slots)
+	ts.tick += int64(100*time.Millisecond) / int64(ts.timerWheel.SlotDuration())
+	ts.tick += 1 // one past the threshold
+
+	ts.reclaimIdle()
+
+	if ts.ConnectionCount() != 0 {
+		t.Fatalf("expected 0 connections after idle timeout, got %d", ts.ConnectionCount())
+	}
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+func fakeSegment(srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, payload []byte) *TCPSegment {
+	h := &TCPHeader{
+		SrcPort:    srcPort,
+		DstPort:    dstPort,
+		SeqNum:     seq,
+		AckNum:     ack,
+		Flags:      flags,
+		WindowSize: 65535,
+		DataOffset: 20,
+	}
+	return &TCPSegment{
+		Header:  h,
+		Payload: payload,
+		Tuple:   NewTuple(srcIP, dstIP, srcPort, dstPort),
+	}
+}
+
+func doHandshake(t *testing.T, ts *TCPState, vmIP, gwIP net.IP, srcPort, dstPort uint16) {
+	t.Helper()
+	synSeg := fakeSegment(vmIP, gwIP, srcPort, dstPort, 1000, 0, FlagSYN, nil)
+	ts.InjectSegment(synSeg)
+	ts.Deliberate(time.Now())
+
+	outputs := ts.ConsumeOutputs()
+	if len(outputs) == 0 {
+		t.Fatal("no SYN-ACK in handshake")
+	}
+	synAck := outputs[0]
+
+	ackSeg := fakeSegment(vmIP, gwIP, srcPort, dstPort, 1001, synAck.Header.SeqNum+1, FlagACK, nil)
+	ts.InjectSegment(ackSeg)
+	ts.Deliberate(time.Now())
+}

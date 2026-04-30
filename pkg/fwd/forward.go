@@ -1,0 +1,258 @@
+// Package fwd implements TCP port forwarding from host ports to VM ports.
+// Uses the same non-blocking I/O model as NAT to fit the BDP deliberation loop.
+package fwd
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/pinyin/bdp-netstack/pkg/tcp"
+)
+
+// Entry represents one active forwarded connection.
+type Entry struct {
+	HostConn   net.Conn
+	hostFD     int
+	VMConn     *tcp.Conn
+	VMAddr     string // "ip:port" for logging
+	HostClosed bool
+	VMClosed   bool
+}
+
+// Forwarder manages all port forwarding listeners and active connections.
+type Forwarder struct {
+	gatewayIP net.IP
+	mappings  map[uint16]Mapping   // hostPort → mapping
+	listeners map[uint16]net.Listener
+	entries   map[int]*Entry
+	nextPort  uint32 // atomic counter for unique ephemeral source ports
+	tcpState  *tcp.TCPState
+
+	mu sync.Mutex
+}
+
+func (f *Forwarder) Listeners() map[uint16]net.Listener { return f.listeners }
+func (f *Forwarder) Entries() map[int]*Entry             { return f.entries }
+
+// Mapping defines a single port forwarding rule.
+type Mapping struct {
+	HostPort uint16
+	VMIP     net.IP
+	VMPort   uint16
+}
+
+// New creates a new forwarder.
+func New(gatewayIP net.IP, mappings []Mapping) (*Forwarder, error) {
+	f := &Forwarder{
+		gatewayIP: gatewayIP,
+		mappings:  make(map[uint16]Mapping),
+		listeners: make(map[uint16]net.Listener),
+		entries:   make(map[int]*Entry),
+	}
+
+	for _, m := range mappings {
+		f.mappings[m.HostPort] = m
+
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", m.HostPort))
+		if err != nil {
+			return nil, fmt.Errorf("listen :%d: %w", m.HostPort, err)
+		}
+		f.listeners[m.HostPort] = ln
+		log.Printf("Forwarder: :%d → %s:%d", m.HostPort, m.VMIP, m.VMPort)
+	}
+
+	return f, nil
+}
+
+// PollAccept checks all listeners for new connections (non-blocking).
+// Called during the deliberation phase.
+func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
+	f.tcpState = tcpState
+	for hostPort, ln := range f.listeners {
+		for {
+			if tl, ok := ln.(*net.TCPListener); ok {
+				tl.SetDeadline(time.Now().Add(time.Millisecond))
+			}
+			conn, err := ln.Accept()
+			if err != nil {
+				if isEAGAIN(err) || isTimeout(err) {
+					break
+				}
+				log.Printf("Forwarder: accept error on :%d: %v", hostPort, err)
+				break
+			}
+
+			fd := 0
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				rawConn, err := tcpConn.SyscallConn()
+				if err == nil {
+					rawConn.Control(func(f uintptr) {
+						fd = int(f)
+						syscall.SetNonblock(fd, true)
+					})
+				}
+			}
+
+			vmTuple, vmAddr := f.createVMTuple(hostPort)
+			if vmTuple == nil {
+				conn.Close()
+				continue
+			}
+
+			vmConn := tcpState.ActiveOpen(*vmTuple, 65535)
+			f.entries[fd] = &Entry{
+				HostConn: conn,
+				hostFD:   fd,
+				VMConn:   vmConn,
+				VMAddr:   vmAddr,
+			}
+
+			log.Printf("Forwarder: new connection :%d → %s", hostPort, vmAddr)
+		}
+	}
+}
+
+// Poll reads from host connections and writes to VM send buffers.
+// Called during the deliberation phase, before TCP deliberation.
+func (f *Forwarder) Poll() {
+	for _, entry := range f.entries {
+		if entry.HostClosed || entry.hostFD == 0 {
+			continue
+		}
+		f.readHost(entry)
+	}
+}
+
+// ProxyVMToHost reads from VM receive buffers and writes to host connections.
+// Called after TCP deliberation.
+func (f *Forwarder) ProxyVMToHost() {
+	for _, entry := range f.entries {
+		if entry.HostClosed || entry.VMConn == nil {
+			continue
+		}
+		f.writeHost(entry)
+	}
+}
+
+// Cleanup removes closed entries.
+func (f *Forwarder) Cleanup() {
+	for fd, entry := range f.entries {
+		// Derive VMClosed from the TCP connection state:
+		// - FinReceived means the VM has sent FIN to us
+		// - If VMConn is nil, the connection was never fully established
+		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.FinReceived {
+			entry.VMClosed = true
+		}
+		if entry.HostClosed && entry.VMClosed {
+			if entry.HostConn != nil {
+				entry.HostConn.Close()
+			}
+			delete(f.entries, fd)
+		}
+	}
+}
+
+// Mappings returns the configured port mappings (for the stack layer).
+// This is needed for stack to set up ARP entries for VM IPs.
+func (f *Forwarder) VMTargets() []net.IP {
+	seen := make(map[string]bool)
+	var ips []net.IP
+	for _, entry := range f.entries {
+		key := entry.VMAddr
+		if !seen[key] {
+			seen[key] = true
+			// IP is embedded in VMAddr "ip:port"
+			host, _, _ := net.SplitHostPort(entry.VMAddr)
+			if ip := net.ParseIP(host); ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips
+}
+
+// Count returns the number of active forwarded connections.
+func (f *Forwarder) Count() int {
+	return len(f.entries)
+}
+
+// createVMTuple builds the TCP tuple for the VM-side connection.
+func (f *Forwarder) createVMTuple(hostPort uint16) (*tcp.Tuple, string) {
+	m, ok := f.mappings[hostPort]
+	if !ok {
+		return nil, ""
+	}
+	// Unique ephemeral source port per connection to avoid tuple collisions
+	p := atomic.AddUint32(&f.nextPort, 1)
+	gwPort := uint16(32768 + (p % 28231)) // 32768..60999, wraps safely
+	vmAddr := net.JoinHostPort(m.VMIP.String(), fmt.Sprintf("%d", m.VMPort))
+	tuple := tcp.NewTuple(f.gatewayIP, m.VMIP, gwPort, m.VMPort)
+	return &tuple, vmAddr
+}
+
+// readHost reads from host connection into VM send buffer (non-blocking).
+func (f *Forwarder) readHost(entry *Entry) {
+	buf := make([]byte, 65536)
+	n, err := syscall.Read(entry.hostFD, buf)
+	if err != nil {
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			return
+		}
+		log.Printf("Forwarder: host read error: %v", err)
+		entry.HostClosed = true
+		if entry.VMConn != nil && f.tcpState != nil {
+			// Use AppClose to trigger proper BDP state transition (Established → FinWait1)
+			f.tcpState.AppClose(entry.VMConn.Tuple)
+		}
+		return
+	}
+	if n == 0 {
+		entry.HostClosed = true
+		if entry.VMConn != nil && f.tcpState != nil {
+			f.tcpState.AppClose(entry.VMConn.Tuple)
+		}
+		return
+	}
+
+	if entry.VMConn != nil {
+		entry.VMConn.WriteSendBuf(buf[:n])
+	}
+}
+
+// writeHost writes from VM receive buffer to host connection.
+func (f *Forwarder) writeHost(entry *Entry) {
+	buf := make([]byte, 65536)
+	n := entry.VMConn.ReadRecvBuf(buf)
+	if n == 0 {
+		return
+	}
+
+	_, err := entry.HostConn.Write(buf[:n])
+	if err != nil {
+		log.Printf("Forwarder: host write error: %v", err)
+		entry.HostClosed = true
+	}
+}
+
+func isEAGAIN(err error) bool {
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Err == syscall.EAGAIN || opErr.Err == syscall.EWOULDBLOCK
+	}
+	return false
+}
+
+func isTimeout(err error) bool {
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Timeout()
+	}
+	if osErr, ok := err.(*os.SyscallError); ok {
+		return osErr.Err == syscall.EAGAIN
+	}
+	return false
+}

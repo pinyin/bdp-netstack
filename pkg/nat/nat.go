@@ -173,7 +173,7 @@ func (t *Table) readHost(entry *Entry) {
 		return
 	}
 
-	buf := make([]byte, 65536)
+	buf := entry.hostBuf
 	n, err := syscall.Read(entry.hostFD, buf)
 	if err != nil {
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
@@ -204,7 +204,7 @@ func (t *Table) readHost(entry *Entry) {
 
 // writeHost writes data from VM receive buffer to host connection.
 func (t *Table) writeHost(entry *Entry) {
-	buf := make([]byte, 65536)
+	buf := entry.hostBuf
 	n := entry.VMConn.ReadRecvBuf(buf)
 	if n == 0 {
 		return

@@ -21,6 +21,7 @@ type Entry struct {
 	hostFD     int
 	VMConn     *tcp.Conn
 	VMAddr     string // "ip:port" for logging
+	hostBuf    []byte // pre-allocated read buffer
 	HostClosed bool
 	VMClosed   bool
 }
@@ -111,6 +112,7 @@ func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
 				hostFD:   fd,
 				VMConn:   vmConn,
 				VMAddr:   vmAddr,
+				hostBuf:  make([]byte, 65536),
 			}
 
 			log.Printf("Forwarder: new connection :%d → %s", hostPort, vmAddr)
@@ -198,7 +200,7 @@ func (f *Forwarder) createVMTuple(hostPort uint16) (*tcp.Tuple, string) {
 
 // readHost reads from host connection into VM send buffer (non-blocking).
 func (f *Forwarder) readHost(entry *Entry) {
-	buf := make([]byte, 65536)
+	buf := entry.hostBuf
 	n, err := syscall.Read(entry.hostFD, buf)
 	if err != nil {
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
@@ -227,7 +229,7 @@ func (f *Forwarder) readHost(entry *Entry) {
 
 // writeHost writes from VM receive buffer to host connection.
 func (f *Forwarder) writeHost(entry *Entry) {
-	buf := make([]byte, 65536)
+	buf := entry.hostBuf
 	n := entry.VMConn.ReadRecvBuf(buf)
 	if n == 0 {
 		return

@@ -497,17 +497,11 @@ func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
 			len(seg.Payload), dstMAC)
 	}
 
-	tcpHeader := &tcp.TCPHeader{
-		SrcPort:    seg.Tuple.SrcPort,
-		DstPort:    seg.Tuple.DstPort,
-		SeqNum:     seg.Header.SeqNum,
-		AckNum:     seg.Header.AckNum,
-		Flags:      seg.Header.Flags,
-		WindowSize: seg.Header.WindowSize,
-	}
-	tcpBytes := tcpHeader.Marshal()
-	if len(seg.Payload) > 0 {
-		tcpBytes = append(tcpBytes, seg.Payload...)
+	tcpBytes := seg.Raw
+	if tcpBytes == nil {
+		// Fallback for segments not built via BuildSegment (shouldn't happen)
+		tcpHdr := seg.Header.Marshal()
+		tcpBytes = append(tcpHdr, seg.Payload...)
 	}
 	cs := tcp.TCPChecksum(seg.Tuple.SrcIPNet(), seg.Tuple.DstIPNet(), tcpBytes)
 	tcpBytes[16] = byte(cs >> 8)

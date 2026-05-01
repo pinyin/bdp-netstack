@@ -237,10 +237,12 @@ func (c *Conn) WriteRecvBuf(data []byte) int {
 	if n > c.RecvWritable() {
 		n = c.RecvWritable()
 	}
-	for i := 0; i < n; i++ {
-		c.RecvBuf[c.recvTail] = data[i]
-		c.recvTail = (c.recvTail + 1) % len(c.RecvBuf)
+	if n == 0 {
+		return 0
 	}
+	first := copy(c.RecvBuf[c.recvTail:], data[:min(n, len(c.RecvBuf)-c.recvTail)])
+	copy(c.RecvBuf, data[first:n])
+	c.recvTail = (c.recvTail + n) % len(c.RecvBuf)
 	c.recvSize += n
 	return n
 }
@@ -251,10 +253,12 @@ func (c *Conn) ReadRecvBuf(buf []byte) int {
 	if n > c.recvSize {
 		n = c.recvSize
 	}
-	for i := 0; i < n; i++ {
-		buf[i] = c.RecvBuf[c.recvHead]
-		c.recvHead = (c.recvHead + 1) % len(c.RecvBuf)
+	if n == 0 {
+		return 0
 	}
+	first := copy(buf, c.RecvBuf[c.recvHead:c.recvHead+min(n, len(c.RecvBuf)-c.recvHead)])
+	copy(buf[first:n], c.RecvBuf)
+	c.recvHead = (c.recvHead + n) % len(c.RecvBuf)
 	c.recvSize -= n
 	return n
 }
@@ -267,18 +271,17 @@ func (c *Conn) SendSpace() int { return len(c.SendBuf) - c.sendSize }
 
 // WriteSendBuf writes data into the send buffer (from application).
 func (c *Conn) WriteSendBuf(data []byte) int {
-	avail := len(c.SendBuf) - c.sendSize
-	if avail == 0 {
+	space := len(c.SendBuf) - c.sendSize
+	if space == 0 {
 		return 0
 	}
 	n := len(data)
-	if n > avail {
-		n = avail
+	if n > space {
+		n = space
 	}
-	for i := 0; i < n; i++ {
-		c.SendBuf[c.sendTail] = data[i]
-		c.sendTail = (c.sendTail + 1) % len(c.SendBuf)
-	}
+	first := copy(c.SendBuf[c.sendTail:], data[:min(n, len(c.SendBuf)-c.sendTail)])
+	copy(c.SendBuf, data[first:n])
+	c.sendTail = (c.sendTail + n) % len(c.SendBuf)
 	c.sendSize += n
 	return n
 }
@@ -288,11 +291,13 @@ func (c *Conn) AckSendBuf(seq uint32) {
 	if seq <= c.SND_UNA {
 		return // duplicate or old ACK
 	}
-	for c.SND_UNA != seq && c.sendSize > 0 {
-		c.sendHead = (c.sendHead + 1) % len(c.SendBuf)
-		c.SND_UNA++
-		c.sendSize--
+	acked := int(seq - c.SND_UNA)
+	if acked > c.sendSize {
+		acked = c.sendSize
 	}
+	c.sendHead = (c.sendHead + acked) % len(c.SendBuf)
+	c.SND_UNA += uint32(acked)
+	c.sendSize -= acked
 }
 
 // PeekSendData returns a slice of data ready to send, limited by window.
@@ -314,9 +319,8 @@ func (c *Conn) PeekSendData(max int) []byte {
 	}
 	data := make([]byte, n)
 	start := (c.sendHead + sent) % len(c.SendBuf)
-	for i := 0; i < n; i++ {
-		data[i] = c.SendBuf[(start+i)%len(c.SendBuf)]
-	}
+	first := copy(data, c.SendBuf[start:start+min(n, len(c.SendBuf)-start)])
+	copy(data[first:n], c.SendBuf)
 	return data
 }
 
@@ -335,8 +339,8 @@ type AppData struct {
 
 func BuildSegment(tuple Tuple, seq, ack uint32, flags uint8, window uint16, payload []byte) []byte {
 	h := &TCPHeader{
-		SrcPort:    tuple.DstPort, // response: swap src/dst
-		DstPort:    tuple.SrcPort,
+		SrcPort:    tuple.SrcPort,
+		DstPort:    tuple.DstPort,
 		SeqNum:     seq,
 		AckNum:     ack,
 		Flags:      flags,

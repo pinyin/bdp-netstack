@@ -180,7 +180,7 @@ func (ts *TCPState) sendSYN(conn *Conn) {
 	rawSeg := BuildSegment(conn.Tuple, conn.ISS, 0, FlagSYN, uint16(conn.RecvWritable()), nil)
 	ts.outputs = append(ts.outputs, &TCPSegment{
 		Header: &TCPHeader{
-			SrcPort: conn.Tuple.DstPort, DstPort: conn.Tuple.SrcPort,
+			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: 0,
 			Flags: FlagSYN, WindowSize: uint16(conn.RecvWritable()),
 		},
@@ -237,7 +237,7 @@ func (ts *TCPState) sendSYNACK(conn *Conn) {
 		FlagSYN|FlagACK, uint16(conn.RecvWritable()), nil)
 	ts.outputs = append(ts.outputs, &TCPSegment{
 		Header: &TCPHeader{
-			SrcPort: conn.Tuple.DstPort, DstPort: conn.Tuple.SrcPort,
+			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: conn.RCV_NXT,
 			Flags: FlagSYN | FlagACK, WindowSize: uint16(conn.RecvWritable()),
 		},
@@ -540,27 +540,29 @@ func (ts *TCPState) reclaimIdle() {
 // ============================================================================
 
 func (ts *TCPState) sendDataAndAcks(conn *Conn) {
-	// Calculate how much data we can send
-	inFlight := conn.SND_NXT - conn.SND_UNA
-	window := conn.SND_WND
-	if window == 0 {
-		window = 65535
-	}
-	canSend := int(window) - int(inFlight)
-	if canSend < 0 {
-		canSend = 0
-	}
-	if canSend > ts.cfg.MTU-20 {
-		canSend = ts.cfg.MTU - 20
-	}
+	mss := ts.cfg.MTU - 20
+	sentData := false
 
-	data := conn.PeekSendData(canSend)
+	for {
+		inFlight := conn.SND_NXT - conn.SND_UNA
+		window := conn.SND_WND
+		if window == 0 {
+			window = 65535
+		}
+		canSend := int(window) - int(inFlight)
+		if canSend <= 0 {
+			break // window full
+		}
+		if canSend > mss {
+			canSend = mss
+		}
 
-	debug.Global.TCPInFlight.Store(int64(inFlight))
-	debug.Global.TCPCanSend.Store(int64(canSend))
+		data := conn.PeekSendData(canSend)
+		if len(data) == 0 {
+			break // no more data to send
+		}
 
-	if len(data) > 0 {
-		// Send data + ACK
+		sentData = true
 		debug.Global.TCPDataSegs.Add(1)
 		debug.Global.TCPDataBytes.Add(int64(len(data)))
 		flags := uint8(FlagACK | FlagPSH)
@@ -568,17 +570,21 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 			flags, uint16(conn.RecvWritable()), data)
 
 		conn.SND_NXT += uint32(len(data))
-		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
-		ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 
 		ts.outputs = append(ts.outputs, &TCPSegment{
-			Header:  &TCPHeader{SrcPort: conn.Tuple.DstPort, DstPort: conn.Tuple.SrcPort, SeqNum: conn.SND_NXT - uint32(len(data)), AckNum: conn.RCV_NXT, Flags: flags, WindowSize: uint16(conn.RecvWritable())},
+			Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT - uint32(len(data)), AckNum: conn.RCV_NXT, Flags: flags, WindowSize: uint16(conn.RecvWritable())},
 			Tuple:   conn.Tuple,
 			Payload: data,
 			Raw:     rawSeg,
 		})
+	}
+
+	if sentData {
+		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
+		ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
+		debug.Global.TCPInFlight.Store(int64(conn.SND_NXT - conn.SND_UNA))
+		debug.Global.TCPCanSend.Store(int64(mss))
 	} else if ts.needACK(conn) {
-		// Send pure ACK
 		debug.Global.TCPAckOnly.Add(1)
 		ts.sendACK(conn)
 	} else {
@@ -594,7 +600,7 @@ func (ts *TCPState) sendACK(conn *Conn) {
 	conn.LastAckTime = ts.tick
 
 	ts.outputs = append(ts.outputs, &TCPSegment{
-		Header:  &TCPHeader{SrcPort: conn.Tuple.DstPort, DstPort: conn.Tuple.SrcPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagACK, WindowSize: uint16(conn.RecvWritable())},
+		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagACK, WindowSize: uint16(conn.RecvWritable())},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
 	})
@@ -605,7 +611,7 @@ func (ts *TCPState) sendFIN(conn *Conn) {
 		FlagFIN|FlagACK, uint16(conn.RecvWritable()), nil)
 
 	ts.outputs = append(ts.outputs, &TCPSegment{
-		Header:  &TCPHeader{SrcPort: conn.Tuple.DstPort, DstPort: conn.Tuple.SrcPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagFIN | FlagACK, WindowSize: uint16(conn.RecvWritable())},
+		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagFIN | FlagACK, WindowSize: uint16(conn.RecvWritable())},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
 	})

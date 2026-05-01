@@ -82,6 +82,8 @@ func main() {
 	tcpCfg.ListenPort = 0 // no listener by default
 	tcpCfg.GatewayIP = gwIP
 	tcpCfg.BufferSize = *bufSize
+	tcpCfg.MTU = *mtu - 20 // IP payload max (TCP segment = MTU - IP header)
+	tcpCfg.BPT = *bpt
 
 	ts := tcp.NewTCPState(tcpCfg)
 

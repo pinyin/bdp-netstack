@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/pinyin/bdp-netstack/pkg/debug"
 	"github.com/pinyin/bdp-netstack/pkg/dhcp"
 	"github.com/pinyin/bdp-netstack/pkg/dns"
 	"github.com/pinyin/bdp-netstack/pkg/ether"
@@ -241,6 +242,9 @@ func (s *Stack) deliberate(now time.Time) {
 
 	// Phase 16: UDP NAT cleanup
 	s.udpNAT.Cleanup(now)
+
+	// Print periodic debug stats (every ~1s)
+	debug.Global.PrintIfDue()
 }
 
 // sendICMPReply writes an ICMP Echo Reply back to the VM.
@@ -480,15 +484,18 @@ func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
 	dstIP := seg.Tuple.DstIPNet()
 	dstMAC, ok := s.arp.Lookup(dstIP)
 	if !ok {
+		debug.Global.OutARPMiss.Add(1)
 		log.Printf("no ARP entry for %s, dropping TCP segment (flags=%d, sport=%d, dport=%d)", dstIP, seg.Header.Flags, seg.Tuple.SrcPort, seg.Tuple.DstPort)
 		return
 	}
 
-	log.Printf("TCP send: %s:%d → %s:%d (flags=%d, seq=%d, ack=%d, len=%d, dstMAC=%s)",
-		seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
-		dstIP, seg.Tuple.DstPort,
-		seg.Header.Flags, seg.Header.SeqNum, seg.Header.AckNum,
-		len(seg.Payload), dstMAC)
+	if s.cfg.Debug {
+		log.Printf("TCP send: %s:%d → %s:%d (flags=%d, seq=%d, ack=%d, len=%d, dstMAC=%s)",
+			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
+			dstIP, seg.Tuple.DstPort,
+			seg.Header.Flags, seg.Header.SeqNum, seg.Header.AckNum,
+			len(seg.Payload), dstMAC)
+	}
 
 	tcpHeader := &tcp.TCPHeader{
 		SrcPort:    seg.Tuple.SrcPort,
@@ -518,6 +525,8 @@ func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
 		Payload:  tcpBytes,
 	}
 
+	debug.Global.OutSegs.Add(1)
+	debug.Global.OutBytes.Add(int64(len(seg.Payload)))
 	s.writeIPv4Packet(dstMAC, ipPkt)
 }
 

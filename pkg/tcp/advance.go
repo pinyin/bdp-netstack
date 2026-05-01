@@ -2,6 +2,8 @@ package tcp
 
 import (
 	"time"
+
+	"github.com/pinyin/bdp-netstack/pkg/debug"
 )
 
 // ============================================================================
@@ -444,6 +446,10 @@ func (ts *TCPState) advanceFinWait1() {
 			continue
 		}
 
+		// Drain send buffer before first FIN (safety net for premature AppClose)
+		if !conn.FinSent {
+			ts.sendDataAndAcks(conn)
+		}
 		// Send/Resend FIN
 		ts.sendFIN(conn)
 		conn.PendingSegs = nil
@@ -550,8 +556,13 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 
 	data := conn.PeekSendData(canSend)
 
+	debug.Global.TCPInFlight.Store(int64(inFlight))
+	debug.Global.TCPCanSend.Store(int64(canSend))
+
 	if len(data) > 0 {
 		// Send data + ACK
+		debug.Global.TCPDataSegs.Add(1)
+		debug.Global.TCPDataBytes.Add(int64(len(data)))
 		flags := uint8(FlagACK | FlagPSH)
 		rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
 			flags, uint16(conn.RecvWritable()), data)
@@ -568,7 +579,10 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 		})
 	} else if ts.needACK(conn) {
 		// Send pure ACK
+		debug.Global.TCPAckOnly.Add(1)
 		ts.sendACK(conn)
+	} else {
+		debug.Global.TCPNoSend.Add(1)
 	}
 }
 

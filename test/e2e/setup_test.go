@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,7 @@ type E2EEnv struct {
 }
 
 // setupE2E builds the stack, starts vfkit, and waits for SSH readiness.
-func setupE2E(t *testing.T) *E2EEnv {
+func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 	t.Helper()
 
 	if testing.Short() {
@@ -78,26 +79,55 @@ func setupE2E(t *testing.T) *E2EEnv {
 		t.Fatalf("build bdp-netstack: %v\n%s", err, out)
 	}
 
+	// Open log files so we can inspect them even if the test is killed.
+	// Save e2e log to /tmp (not tmpDir) so it survives cleanup.
+	e2eLogPath := filepath.Join(os.TempDir(), "bdp-e2e-test.log")
+	e2eLog, err := os.Create(e2eLogPath)
+	if err != nil {
+		t.Fatalf("create e2e log: %v", err)
+	}
+	stackLog, err := os.Create(filepath.Join(tmpDir, "stack.log"))
+	if err != nil {
+		t.Fatalf("create stack log: %v", err)
+	}
+	vfkitLog, err := os.Create(filepath.Join(tmpDir, "vfkit.log"))
+	if err != nil {
+		t.Fatalf("create vfkit log: %v", err)
+	}
+	logf := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf("%s "+format+"\n", append([]interface{}{time.Now().Format("15:04:05.000")}, args...)...)
+		e2eLog.WriteString(msg)
+		t.Logf(format, args...)
+	}
+	logf("=== TestE2EBasic starting ===")
+	logf("log files: e2e=%s, stack=%s/stack.log, vfkit=%s/vfkit.log", e2eLogPath, tmpDir, tmpDir)
+
 	// Start stack
 	ctx, cancel := context.WithCancel(context.Background())
 
 	forwardSpec := strconv.Itoa(sshPort) + ":" + vmIP + ":22"
-	stackCmd := exec.CommandContext(ctx, binPath,
+	args := []string{
 		"--socket", sockPath,
 		"--gateway-ip", gwIP,
 		"--gateway-mac", gwMAC,
 		"--bpt", "1ms",
 		forwardSpec,
-	)
-	stackCmd.Stderr = os.Stderr
-	stackCmd.Stdout = os.Stdout
+	}
+	args = append(args, extraForwards...)
+	stackCmd := exec.CommandContext(ctx, binPath, args...)
+	stackCmd.Stderr = stackLog
+	stackCmd.Stdout = stackLog
+	logf("starting bdp-netstack: %s %v", binPath, args)
 	if err := stackCmd.Start(); err != nil {
+		logf("FAIL: start bdp-netstack: %v", err)
 		cancel()
 		os.RemoveAll(tmpDir)
 		t.Fatalf("start bdp-netstack: %v", err)
 	}
+	logf("bdp-netstack started (pid=%d)", stackCmd.Process.Pid)
 
 	// Wait for socket
+	logf("waiting for socket %s...", sockPath)
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sockPath); err == nil {
 			break
@@ -105,10 +135,12 @@ func setupE2E(t *testing.T) *E2EEnv {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if _, err := os.Stat(sockPath); err != nil {
+		logf("FAIL: socket didn't appear: %v", err)
 		cancel()
 		os.RemoveAll(tmpDir)
 		t.Fatalf("bdp-netstack socket didn't appear: %v", err)
 	}
+	logf("socket ready")
 
 	// Start vfkit
 	vfkitPath, err := exec.LookPath("vfkit")
@@ -128,13 +160,16 @@ func setupE2E(t *testing.T) *E2EEnv {
 		"--device", "virtio-serial,logFilePath=" + consoleLogPath,
 	}
 	vfkitCmd := exec.CommandContext(ctx, vfkitPath, vfkitArgs...)
-	vfkitCmd.Stderr = os.Stderr
-	vfkitCmd.Stdout = os.Stdout
+	vfkitCmd.Stderr = vfkitLog
+	vfkitCmd.Stdout = vfkitLog
+	logf("starting vfkit: %s %v", vfkitPath, vfkitArgs)
 	if err := vfkitCmd.Start(); err != nil {
+		logf("FAIL: start vfkit: %v", err)
 		cancel()
 		os.RemoveAll(tmpDir)
 		t.Fatalf("start vfkit: %v", err)
 	}
+	logf("vfkit started (pid=%d)", vfkitCmd.Process.Pid)
 
 	env := &E2EEnv{
 		Ctx:        ctx,
@@ -147,24 +182,30 @@ func setupE2E(t *testing.T) *E2EEnv {
 	}
 
 	// Wait for SSH
+	logf("waiting for SSH on 127.0.0.1:%d...", sshPort)
 	sshReady := false
 	for i := 0; i < 120; i++ {
 		cmd := env.SSHCommand("whoami")
 		out, err := cmd.Output()
 		if err == nil && string(out) == sshUser+"\n" {
 			sshReady = true
+			logf("SSH ready at attempt %d (%.0fs)", i+1, float64(i+1)*2)
 			break
 		}
 		if i < 10 || i%15 == 0 {
-			t.Logf("waiting for SSH... (%ds)", i*2)
+			errStr := ""
+			if err != nil {
+				errStr = fmt.Sprintf(" err=%v", err)
+			}
+			logf("SSH attempt %d/%d%s", i+1, 120, errStr)
 		}
 		time.Sleep(2 * time.Second)
 	}
 	if !sshReady {
+		logf("FAIL: SSH never became available after 120 attempts")
 		env.Cleanup()
 		t.Fatal("SSH never became available")
 	}
-	t.Log("SSH is ready")
 
 	time.Sleep(3 * time.Second) // network settle
 	return env
@@ -186,6 +227,7 @@ func (e *E2EEnv) SSHCommand(cmd string) *exec.Cmd {
 
 // Cleanup tears down the test environment.
 func (e *E2EEnv) Cleanup() {
+	e.t.Logf("Cleanup: killing processes...")
 	if e.StackCmd != nil && e.StackCmd.Process != nil {
 		e.StackCmd.Process.Kill()
 	}
@@ -193,8 +235,10 @@ func (e *E2EEnv) Cleanup() {
 		e.VfkitCmd.Process.Kill()
 	}
 	e.Cancel()
+	e.t.Logf("Logs preserved at: /tmp/bdp-e2e-test.log")
 	if e.TmpDir != "" {
-		os.RemoveAll(e.TmpDir)
+		e.t.Logf("Stack+vfkit logs at: %s/", e.TmpDir)
+		// Keep tmpDir for post-mortem; OS cleans /tmp eventually
 	}
 }
 
@@ -244,6 +288,66 @@ func (e *E2EEnv) sshCmdOK(desc, cmd string) string {
 		e.t.Fatalf("%s (%s): %v\n%s", desc, cmd, err, out)
 	}
 	return out
+}
+
+// scp copies a file to or from the VM via SCP.
+func (e *E2EEnv) scp(src, dst string) error {
+	cmd := exec.Command("/usr/bin/scp",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "IdentitiesOnly=yes",
+		"-i", e.PrivateKey,
+		"-P", strconv.Itoa(sshPort),
+		src, dst,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("scp %s %s: %v\n%s", src, dst, err, string(out))
+	}
+	return nil
+}
+
+// scpToVM copies a local file to the VM's destination directory.
+func (e *E2EEnv) scpToVM(srcPath, dstDir string) error {
+	return e.scp(srcPath, fmt.Sprintf("%s@127.0.0.1:%s", sshUser, dstDir))
+}
+
+// scpFromVM copies a file from the VM to a local destination directory.
+func (e *E2EEnv) scpFromVM(srcPath, dstDir string) error {
+	return e.scp(fmt.Sprintf("%s@127.0.0.1:%s", sshUser, srcPath), dstDir)
+}
+
+// uploadFile uploads a local file to the VM via SSH pipe (cat | ssh "cat > dst").
+// This avoids SCP dependencies entirely.
+func (e *E2EEnv) uploadFile(localPath, vmPath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	cmd := e.SSHCommand(fmt.Sprintf("cat > %s", vmPath))
+	cmd.Stdin = f
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("upload to %s: %v\n%s", vmPath, err, string(out))
+	}
+	return nil
+}
+
+// downloadFile downloads a file from the VM via SSH pipe (ssh "cat src" > localPath).
+func (e *E2EEnv) downloadFile(vmPath, localPath string) error {
+	f, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	cmd := e.SSHCommand(fmt.Sprintf("cat %s", vmPath))
+	cmd.Stdout = f
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("download %s: %v\n%s", vmPath, err, string(out))
+	}
+	return nil
 }
 
 func containsAll(s string, needles ...string) bool {

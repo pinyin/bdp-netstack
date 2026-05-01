@@ -169,6 +169,7 @@ type Conn struct {
 	SendBuf    []byte
 	sendHead   int
 	sendTail   int
+	sendSize   int // bytes in SendBuf (avoids full-vs-empty ambiguity)
 	RecvBuf    []byte
 	recvHead   int
 	recvTail   int
@@ -258,17 +259,15 @@ func (c *Conn) ReadRecvBuf(buf []byte) int {
 	return n
 }
 
-// SendAvail returns the number of bytes available to send.
-func (c *Conn) SendAvail() int {
-	if c.sendTail >= c.sendHead {
-		return c.sendTail - c.sendHead
-	}
-	return len(c.SendBuf) - c.sendHead + c.sendTail
-}
+// SendAvail returns the number of bytes available to send (data in buffer).
+func (c *Conn) SendAvail() int { return c.sendSize }
+
+// SendSpace returns the number of free bytes in the send buffer.
+func (c *Conn) SendSpace() int { return len(c.SendBuf) - c.sendSize }
 
 // WriteSendBuf writes data into the send buffer (from application).
 func (c *Conn) WriteSendBuf(data []byte) int {
-	avail := len(c.SendBuf) - c.SendAvail()
+	avail := len(c.SendBuf) - c.sendSize
 	if avail == 0 {
 		return 0
 	}
@@ -280,6 +279,7 @@ func (c *Conn) WriteSendBuf(data []byte) int {
 		c.SendBuf[c.sendTail] = data[i]
 		c.sendTail = (c.sendTail + 1) % len(c.SendBuf)
 	}
+	c.sendSize += n
 	return n
 }
 
@@ -288,9 +288,10 @@ func (c *Conn) AckSendBuf(seq uint32) {
 	if seq <= c.SND_UNA {
 		return // duplicate or old ACK
 	}
-	for c.SND_UNA != seq && c.SendAvail() > 0 {
+	for c.SND_UNA != seq && c.sendSize > 0 {
 		c.sendHead = (c.sendHead + 1) % len(c.SendBuf)
 		c.SND_UNA++
+		c.sendSize--
 	}
 }
 

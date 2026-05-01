@@ -12,18 +12,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pinyin/bdp-netstack/pkg/debug"
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
 )
 
 // Entry represents one active forwarded connection.
 type Entry struct {
-	HostConn   net.Conn
-	hostFD     int
-	VMConn     *tcp.Conn
-	VMAddr     string // "ip:port" for logging
-	hostBuf    []byte // pre-allocated read buffer
-	HostClosed bool
-	VMClosed   bool
+	HostConn      net.Conn
+	hostFD        int
+	VMConn        *tcp.Conn
+	VMAddr        string // "ip:port" for logging
+	hostBuf       []byte // pre-allocated read buffer
+	HostClosed    bool
+	VMClosed      bool
+	deferredClose bool // host EOF seen but send buffer not yet drained
 }
 
 // Forwarder manages all port forwarding listeners and active connections.
@@ -124,7 +126,18 @@ func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
 // Called during the deliberation phase, before TCP deliberation.
 func (f *Forwarder) Poll() {
 	for _, entry := range f.entries {
-		if entry.HostClosed || entry.hostFD == 0 {
+		if entry.hostFD == 0 {
+			continue
+		}
+		if entry.HostClosed {
+			// Deferred close: host EOF was seen but data remains in send buffer.
+			// Wait until TCP deliberation drains it before calling AppClose.
+			if entry.deferredClose && entry.VMConn != nil && entry.VMConn.SendAvail() == 0 {
+				entry.deferredClose = false
+				if f.tcpState != nil {
+					f.tcpState.AppClose(entry.VMConn.Tuple)
+				}
+			}
 			continue
 		}
 		f.readHost(entry)
@@ -199,31 +212,57 @@ func (f *Forwarder) createVMTuple(hostPort uint16) (*tcp.Tuple, string) {
 }
 
 // readHost reads from host connection into VM send buffer (non-blocking).
+// Respects send buffer capacity to avoid silently truncating data.
 func (f *Forwarder) readHost(entry *Entry) {
+	if entry.VMConn == nil {
+		return
+	}
+
+	debug.Global.FwdReadCalls.Add(1)
+
+	// Don't read if the VM send buffer is full — let host socket buffer
+	// absorb backpressure naturally.
+	space := entry.VMConn.SendSpace()
+	if space == 0 {
+		debug.Global.FwdBufFull.Add(1)
+		return
+	}
+
 	buf := entry.hostBuf
+	if space < len(buf) {
+		buf = buf[:space]
+	}
 	n, err := syscall.Read(entry.hostFD, buf)
 	if err != nil {
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			debug.Global.FwdReadEAGAIN.Add(1)
 			return
 		}
 		log.Printf("Forwarder: host read error: %v", err)
 		entry.HostClosed = true
-		if entry.VMConn != nil && f.tcpState != nil {
-			// Use AppClose to trigger proper BDP state transition (Established → FinWait1)
-			f.tcpState.AppClose(entry.VMConn.Tuple)
-		}
+		f.maybeClose(entry)
 		return
 	}
 	if n == 0 {
 		entry.HostClosed = true
-		if entry.VMConn != nil && f.tcpState != nil {
-			f.tcpState.AppClose(entry.VMConn.Tuple)
-		}
+		f.maybeClose(entry)
 		return
 	}
 
-	if entry.VMConn != nil {
-		entry.VMConn.WriteSendBuf(buf[:n])
+	debug.Global.FwdReadBytes.Add(int64(n))
+	written := entry.VMConn.WriteSendBuf(buf[:n])
+	debug.Global.FwdBufBytes.Add(int64(written))
+}
+
+// maybeClose defers AppClose if the send buffer still has unsent data,
+// preventing data loss when the host closes before all data is delivered.
+func (f *Forwarder) maybeClose(entry *Entry) {
+	if entry.VMConn != nil && entry.VMConn.SendAvail() > 0 {
+		entry.deferredClose = true
+		return
+	}
+	if f.tcpState != nil && entry.VMConn != nil {
+		f.tcpState.AppClose(entry.VMConn.Tuple)
 	}
 }
 

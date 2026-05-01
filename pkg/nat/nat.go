@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/pinyin/bdp-netstack/pkg/debug"
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
 )
 
@@ -28,8 +29,9 @@ type Entry struct {
 	VMConn *tcp.Conn
 
 	// Closed flags
-	HostClosed bool
-	VMClosed   bool
+	HostClosed    bool
+	VMClosed      bool
+	deferredClose bool // host EOF seen but send buffer not yet drained
 }
 
 // Table is the connection tracking table. All methods are called from
@@ -41,6 +43,8 @@ type Table struct {
 
 	// Pending SYNs intercepted this round: need host dial responses
 	pendingDials []*pendingDial
+
+	tcpState *tcp.TCPState // set during Intercept, used for AppClose
 
 	mu sync.Mutex // protects host I/O edge cases
 }
@@ -60,6 +64,7 @@ func NewTable() *Table {
 // Intercept is called by the stack for TCP segments destined to external IPs.
 // Returns true if the segment was handled by NAT.
 func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
+	t.tcpState = tcpState
 	tuple := seg.Tuple.Reverse() // normalize to VM→Ext direction
 
 	// Existing connection?
@@ -106,7 +111,17 @@ func (t *Table) Poll() {
 
 	// Non-blocking read from all host connections
 	for _, entry := range t.entries {
-		if entry.HostConn == nil || entry.HostClosed {
+		if entry.HostConn == nil {
+			continue
+		}
+		if entry.HostClosed {
+			// Deferred close: host EOF was seen but data remains in send buffer.
+			if entry.deferredClose && entry.VMConn != nil && entry.VMConn.SendAvail() == 0 {
+				entry.deferredClose = false
+				if t.tcpState != nil {
+					t.tcpState.AppClose(entry.VMConn.Tuple)
+				}
+			}
 			continue
 		}
 		t.readHost(entry)
@@ -168,37 +183,57 @@ func (t *Table) doDial(pd *pendingDial) {
 }
 
 // readHost reads available data from a host connection (non-blocking).
+// Respects send buffer capacity to avoid silently truncating data.
 func (t *Table) readHost(entry *Entry) {
-	if entry.hostFD == 0 {
+	if entry.hostFD == 0 || entry.VMConn == nil {
+		return
+	}
+
+	debug.Global.FwdReadCalls.Add(1)
+
+	// Don't read if the VM send buffer is full — backpressure via host socket buffer.
+	space := entry.VMConn.SendSpace()
+	if space == 0 {
+		debug.Global.FwdBufFull.Add(1)
 		return
 	}
 
 	buf := entry.hostBuf
+	if space < len(buf) {
+		buf = buf[:space]
+	}
 	n, err := syscall.Read(entry.hostFD, buf)
 	if err != nil {
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			debug.Global.FwdReadEAGAIN.Add(1)
 			return // no data available
 		}
 		log.Printf("NAT: host read error: %v", err)
 		entry.HostClosed = true
-		if entry.VMConn != nil {
-			entry.VMConn.FinReceived = true
-			entry.VMConn.FinSeq = entry.VMConn.RCV_NXT
-		}
+		t.maybeClose(entry)
 		return
 	}
 	if n == 0 {
 		entry.HostClosed = true
-		if entry.VMConn != nil {
-			entry.VMConn.FinReceived = true
-			entry.VMConn.FinSeq = entry.VMConn.RCV_NXT
-		}
+		t.maybeClose(entry)
 		return
 	}
 
 	// Write data to VM-side connection's send buffer
-	if entry.VMConn != nil {
-		entry.VMConn.WriteSendBuf(buf[:n])
+	debug.Global.FwdReadBytes.Add(int64(n))
+	written := entry.VMConn.WriteSendBuf(buf[:n])
+	debug.Global.FwdBufBytes.Add(int64(written))
+}
+
+// maybeClose defers AppClose if the send buffer still has unsent data,
+// preventing data loss when the host closes before all data is delivered.
+func (t *Table) maybeClose(entry *Entry) {
+	if entry.VMConn != nil && entry.VMConn.SendAvail() > 0 {
+		entry.deferredClose = true
+		return
+	}
+	if t.tcpState != nil && entry.VMConn != nil {
+		t.tcpState.AppClose(entry.VMConn.Tuple)
 	}
 }
 

@@ -69,12 +69,13 @@ func TestE2EBasic(t *testing.T) {
 	})
 
 	t.Run("DNSResolution", func(t *testing.T) {
-		// Actual DNS protocol query via nslookup
-		out := env.sshOutputOK("nslookup example.com")
+		// DNS resolution via getaddrinfo (exercises NSS/DNS code path)
+		// Uses getent ahosts which shows all resolved addresses
+		out := env.sshOutputOK("getent ahosts example.com")
 		if !strings.Contains(out, "example.com") {
-			t.Errorf("nslookup did not resolve example.com:\n%s", out)
+			t.Errorf("getent ahosts did not resolve example.com:\n%s", out)
 		}
-		t.Logf("nslookup: %s", strings.TrimSpace(out))
+		t.Logf("getent ahosts: %s", strings.TrimSpace(out))
 	})
 
 	t.Run("ExternalPing", func(t *testing.T) {

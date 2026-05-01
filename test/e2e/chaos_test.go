@@ -51,7 +51,7 @@ func TestMixedProtocol(t *testing.T) {
 		curl -s -o /dev/null -w 'HTTP:%{http_code}\n' --connect-timeout 10 http://example.com &
 
 		# UDP: DNS query to gateway (uses built-in DNS proxy)
-		nslookup example.com > /tmp/_ns.out 2>&1 &
+		getent ahosts example.com > /tmp/_ns.out 2>&1 &
 
 		# ICMP: ping the gateway
 		ping -c 3 -W 5 ` + gwIP + ` > /tmp/_ping.out 2>&1 &

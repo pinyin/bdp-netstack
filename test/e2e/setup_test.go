@@ -199,9 +199,10 @@ func (e *E2EEnv) Cleanup() {
 }
 
 // sshOutput runs a command via SSH and returns combined output.
+// Uses Output() (stdout only) to avoid SSH stderr warnings polluting results.
 func (e *E2EEnv) sshOutput(cmd string) (string, error) {
 	c := e.SSHCommand(cmd)
-	out, err := c.CombinedOutput()
+	out, err := c.Output()
 	return string(out), err
 }
 
@@ -209,7 +210,10 @@ func (e *E2EEnv) sshOutput(cmd string) (string, error) {
 func (e *E2EEnv) sshOutputOK(cmd string) string {
 	out, err := e.sshOutput(cmd)
 	if err != nil {
-		e.t.Fatalf("%s: %v\n%s", cmd, err, out)
+		// Re-run with CombinedOutput to get stderr for diagnosis
+		c := e.SSHCommand(cmd)
+		fullOut, _ := c.CombinedOutput()
+		e.t.Fatalf("%s: %v\n%s", cmd, err, string(fullOut))
 	}
 	return out
 }
@@ -218,7 +222,9 @@ func (e *E2EEnv) sshOutputOK(cmd string) string {
 func (e *E2EEnv) sshOutputOrLog(cmd string) string {
 	out, err := e.sshOutput(cmd)
 	if err != nil {
-		e.t.Logf("%s (non-fatal): %v\n%s", cmd, err, out)
+		c := e.SSHCommand(cmd)
+		fullOut, _ := c.CombinedOutput()
+		e.t.Logf("%s (non-fatal): %v\n%s", cmd, err, string(fullOut))
 	}
 	return out
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 	"syscall"
 	"time"
 
@@ -46,8 +45,6 @@ type Table struct {
 	pendingDials []*pendingDial
 
 	tcpState *tcp.TCPState // set during Intercept, used for AppClose
-
-	mu sync.Mutex // protects host I/O edge cases
 }
 
 type pendingDial struct {

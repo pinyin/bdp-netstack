@@ -1,6 +1,6 @@
 //go:build darwin
 
-// Package e2e tests the full stack with vfkit + a minimal bootc test image.
+// Package e2e tests the full stack with vz-debug + a minimal bootc test image.
 package e2e
 
 import (

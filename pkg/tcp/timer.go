@@ -6,22 +6,27 @@ import (
 
 // ============================================================================
 // TimerWheel — BDP orthogonal index for time-based events.
-// A simple hash-wheel: N slots, each slot holds a set of Tuples.
+// A simple hash-wheel: N slots, each slot holds a set of (Tuple, absolute tick).
 // Each slot represents a fixed time interval (e.g., 10ms).
 // ============================================================================
 
+type slotEntry struct {
+	tuple Tuple
+	tick  int64 // absolute tick when this timer fires
+}
+
 type TimerWheel struct {
-	slots    []map[Tuple]bool // slot → set of Tuples with timers
-	slotSize time.Duration    // duration of each slot
+	slots    [][]slotEntry // slot → list of (Tuple, absolute tick)
+	slotSize time.Duration // duration of each slot
 	numSlots int
-	cursor   int        // current slot index
-	lastTick int64      // last processed tick (monotonic ns, quantized to slot)
+	cursor   int   // current slot index
+	lastTick int64 // last processed tick (monotonic ns, quantized to slot)
 }
 
 func NewTimerWheel(slotSize time.Duration, numSlots int) *TimerWheel {
-	slots := make([]map[Tuple]bool, numSlots)
+	slots := make([][]slotEntry, numSlots)
 	for i := range slots {
-		slots[i] = make(map[Tuple]bool)
+		slots[i] = nil
 	}
 	return &TimerWheel{
 		slots:    slots,
@@ -43,17 +48,17 @@ func (tw *TimerWheel) Advance(now time.Time) int64 {
 	return tick
 }
 
-// Schedule adds timer events for a connection at the given absolute tick values.
+// Schedule adds a timer event for a connection at the given absolute tick.
 func (tw *TimerWheel) Schedule(tuple Tuple, tick int64) {
 	slot := int(tick % int64(tw.numSlots))
 	if slot < 0 {
 		slot += tw.numSlots
 	}
-	tw.slots[slot][tuple] = true
+	tw.slots[slot] = append(tw.slots[slot], slotEntry{tuple: tuple, tick: tick})
 }
 
 // Expired returns tuples whose timers have expired up to the given tick.
-// The tick represents the current time quantized to slot size.
+// Only returns entries whose absolute tick falls within the scanned range.
 func (tw *TimerWheel) Expired(currentTick int64) []Tuple {
 	if currentTick <= tw.lastTick {
 		return nil
@@ -69,19 +74,23 @@ func (tw *TimerWheel) Expired(currentTick int64) []Tuple {
 		end += tw.numSlots
 	}
 
-	// Collect tuples from slots between lastTick+1 and currentTick (inclusive)
-	tw.lastTick = currentTick
-
-	// Walk through slots
+	// Walk through slots from lastTick+1 to currentTick (inclusive)
 	for i := start + 1; ; i++ {
 		slot := i % tw.numSlots
-		for tuple := range tw.slots[slot] {
-			expired = append(expired, tuple)
-			delete(tw.slots[slot], tuple)
+		remaining := tw.slots[slot][:0]
+		for _, entry := range tw.slots[slot] {
+			if entry.tick <= currentTick {
+				expired = append(expired, entry.tuple)
+			} else {
+				remaining = append(remaining, entry)
+			}
 		}
+		tw.slots[slot] = remaining
 		if slot == end {
 			break
 		}
 	}
+
+	tw.lastTick = currentTick
 	return expired
 }

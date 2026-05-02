@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/udp"
 )
@@ -51,7 +52,7 @@ func (p *Proxy) forward(dg *udp.UDPDatagram) *udp.UDPDatagram {
 		return p.servfail(dg)
 	}
 
-	conn, err := net.Dial("udp", p.upstream)
+	conn, err := net.DialTimeout("udp", p.upstream, 2*time.Second)
 	if err != nil {
 		return p.servfail(dg)
 	}
@@ -61,6 +62,7 @@ func (p *Proxy) forward(dg *udp.UDPDatagram) *udp.UDPDatagram {
 		return p.servfail(dg)
 	}
 
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	respBuf := make([]byte, 1500)
 	n, err := conn.Read(respBuf)
 	if err != nil {

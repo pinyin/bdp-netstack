@@ -180,6 +180,7 @@ type Conn struct {
 
 	// Timer state
 	RetransmitAt  int64 // absolute tick when retransmit fires
+	RetransmitCount int  // number of consecutive retransmits (for exponential backoff)
 	TimeWaitUntil int64 // absolute tick when TIME_WAIT expires
 
 	// Last ACK sent (to avoid duplicate ACKs)
@@ -324,7 +325,7 @@ func (c *Conn) WriteSendBuf(data []byte) int {
 
 // AckSendBuf removes acked bytes from the send buffer.
 func (c *Conn) AckSendBuf(seq uint32) {
-	if seq <= c.SND_UNA {
+	if !seqGT(seq, c.SND_UNA) {
 		return // duplicate or old ACK
 	}
 	acked := int(seq - c.SND_UNA)
@@ -334,6 +335,7 @@ func (c *Conn) AckSendBuf(seq uint32) {
 	c.sendHead = (c.sendHead + acked) % len(c.SendBuf)
 	c.SND_UNA += uint32(acked)
 	c.sendSize -= acked
+	c.RetransmitCount = 0 // progress made, reset backoff
 }
 
 // PeekSendData returns a slice of data ready to send, limited by window.
@@ -460,6 +462,13 @@ func ParseWindowScale(data []byte) uint8 {
 // ============================================================================
 // Checksum computation for TCP pseudo-header
 // ============================================================================
+
+// Sequence number comparison helpers (RFC 1323: (int32)(a-b) < 0)
+// These correctly handle 32-bit sequence number wraparound after ~4GB of data.
+func seqLT(a, b uint32) bool { return int32(a-b) < 0 }
+func seqLE(a, b uint32) bool { return int32(a-b) <= 0 }
+func seqGT(a, b uint32) bool { return int32(a-b) > 0 }
+func seqGE(a, b uint32) bool { return int32(a-b) >= 0 }
 
 func TCPChecksum(srcIP, dstIP net.IP, tcpData []byte) uint16 {
 	pseudoHdr := make([]byte, 12)

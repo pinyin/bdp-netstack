@@ -26,10 +26,11 @@ type Reply struct {
 
 // pending tracks an outstanding echo request.
 type pending struct {
-	srcIP net.IP
-	dstIP net.IP
-	id    uint16
-	seq   uint16
+	srcIP     net.IP
+	dstIP     net.IP
+	id        uint16
+	seq       uint16
+	createdAt time.Time
 }
 
 // Forwarder proxies ICMP Echo Requests from VM guests to external hosts
@@ -83,10 +84,11 @@ func (f *Forwarder) Forward(srcIP, dstIP net.IP, id, seq uint16, payload []byte)
 
 	k := key(id, seq)
 	f.pending[k] = &pending{
-		srcIP: srcIP,
-		dstIP: dstIP,
-		id:    id,
-		seq:   seq,
+		srcIP:     srcIP,
+		dstIP:     dstIP,
+		id:        id,
+		seq:       seq,
+		createdAt: time.Now(),
 	}
 
 	dst := &net.UDPAddr{IP: dstIP}
@@ -163,7 +165,12 @@ func (f *Forwarder) ConsumeReplies() []Reply {
 
 // Cleanup removes stale pending entries older than the given duration.
 func (f *Forwarder) Cleanup(timeout time.Duration) {
-	// TODO: add timestamp to pending and remove expired entries
+	now := time.Now()
+	for k, p := range f.pending {
+		if now.Sub(p.createdAt) > timeout {
+			delete(f.pending, k)
+		}
+	}
 }
 
 // BuildICMPReplyPacket builds an IPv4 packet containing an ICMP Echo Reply.

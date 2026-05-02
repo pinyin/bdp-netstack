@@ -2,7 +2,6 @@ package tcp
 
 import (
 	"log"
-	"math/rand"
 	"net"
 	"time"
 )
@@ -77,7 +76,6 @@ type TCPState struct {
 	appCloses map[Tuple]bool    // app has closed
 
 	// --- ISN generator ---
-	rng *rand.Rand
 
 	// --- Segment write callback (set by stack layer) ---
 	// When set, segments are written immediately during deliberation.
@@ -110,7 +108,6 @@ func NewTCPState(cfg Config) *TCPState {
 		tick:        time.Now().UnixNano() / int64(tw.SlotDuration()),
 		appWrites:   make(map[Tuple][]byte),
 		appCloses:   make(map[Tuple]bool),
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -156,10 +153,15 @@ func (ts *TCPState) PreProcessACKs() {
 		}
 
 		if conn := ts.findConn(tuple); conn != nil {
-			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
+			if seg.Header.IsACK() && seqGT(seg.Header.AckNum, conn.SND_UNA) {
 				ackDelta := seg.Header.AckNum - conn.SND_UNA
 				conn.AckSendBuf(seg.Header.AckNum) // updates SND_UNA by min(ackDelta, sendSize)
 				conn.SND_WND = uint32(seg.Header.WindowSize) << conn.SndShift
+				// After a retransmit timer reset SND_NXT=SND_UNA, an ACK that was
+				// already in flight may advance SND_UNA past SND_NXT. Keep them in sync.
+				if seqGT(conn.SND_UNA, conn.SND_NXT) {
+					conn.SND_NXT = conn.SND_UNA
+				}
 				if ackDelta > 1000 {
 					log.Printf("PRE-ACK: %s ack=%d→%d (+%d) win=%d sendSize=%d",
 						tuple, seg.Header.AckNum-ackDelta, seg.Header.AckNum,

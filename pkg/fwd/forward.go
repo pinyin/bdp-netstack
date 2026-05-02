@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -36,8 +35,6 @@ type Forwarder struct {
 	entries   map[int]*Entry
 	nextPort  uint32 // atomic counter for unique ephemeral source ports
 	tcpState  *tcp.TCPState
-
-	mu sync.Mutex
 }
 
 func (f *Forwarder) Listeners() map[uint16]net.Listener { return f.listeners }

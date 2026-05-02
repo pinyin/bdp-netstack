@@ -1,6 +1,8 @@
 package tcp
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/debug"
@@ -26,11 +28,16 @@ func (ts *TCPState) processTimers() {
 			conn.SND_NXT = conn.ISS
 			conn.RetransmitAt = 0
 		}
-		if conn, ok := ts.Established[tuple]; ok {
-			// Retransmit: resend last unacked data
-			// For simplicity, re-trigger sending by generating an output
+		if conn, ok := ts.LastAck[tuple]; ok {
+			// Retransmit FIN: allow advanceLastAck to re-send
+			conn.FinSent = false
 			conn.RetransmitAt = 0
-			// Send pending data (will be handled by advanceEstablished)
+		}
+		if conn, ok := ts.Established[tuple]; ok {
+			// Retransmit: reset SND_NXT so PeekSendData re-reads unacked data
+			conn.SND_NXT = conn.SND_UNA
+			conn.RetransmitCount++
+			conn.RetransmitAt = 0
 		}
 		if _, ok := ts.TimeWait[tuple]; ok {
 			// TIME_WAIT expired — the connection is ready to be reclaimed
@@ -90,6 +97,12 @@ func (ts *TCPState) createSynRcvd(seg *TCPSegment) {
 
 	conn := NewConn(tuple, seg.Header.SeqNum, iss, seg.Header.WindowSize, ts.cfg.BufferSize)
 	conn.LastActivityTick = ts.tick
+
+	// Parse window scale from SYN options (RFC 1323)
+	if ws := ParseWindowScale(seg.Raw); ws > 0 {
+		conn.SndShift = ws
+	}
+	conn.RcvShift = ts.cfg.WindowScale
 
 	// Schedule retransmit for SYN-ACK
 		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
@@ -151,6 +164,10 @@ func (ts *TCPState) advanceSynSent() {
 		acked := false
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsSYN() && seg.Header.IsACK() {
+				// Validate SYN-ACK acknowledges our SYN (AckNum == ISS+1 per RFC 793)
+				if seg.Header.AckNum != conn.ISS+1 {
+					continue
+				}
 				// SYN-ACK received
 				conn.IRS = seg.Header.SeqNum
 				conn.RCV_NXT = seg.Header.SeqNum + 1
@@ -302,12 +319,12 @@ func (ts *TCPState) advanceEstablished() {
 		for _, seg := range conn.PendingSegs {
 			// Process ACK
 			if seg.Header.IsACK() {
-				if seg.Header.AckNum > conn.SND_UNA {
+				if seqGT(seg.Header.AckNum, conn.SND_UNA) {
 					conn.AckSendBuf(seg.Header.AckNum)
 				}
 				// Update window even for pure window updates (AckNum == SND_UNA)
-				if seg.Header.AckNum >= conn.SND_UNA {
-					conn.SND_WND = uint32(seg.Header.WindowSize)
+				if seqGE(seg.Header.AckNum, conn.SND_UNA) {
+					conn.SND_WND = uint32(seg.Header.WindowSize) << conn.SndShift
 				}
 			}
 
@@ -367,11 +384,11 @@ func (ts *TCPState) advanceCloseWait() {
 		// Process remaining data/ACKs from peer
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() {
-				if seg.Header.AckNum > conn.SND_UNA {
+				if seqGT(seg.Header.AckNum, conn.SND_UNA) {
 					conn.AckSendBuf(seg.Header.AckNum)
 				}
-				if seg.Header.AckNum >= conn.SND_UNA {
-					conn.SND_WND = uint32(seg.Header.WindowSize)
+				if seqGE(seg.Header.AckNum, conn.SND_UNA) {
+					conn.SND_WND = uint32(seg.Header.WindowSize) << conn.SndShift
 				}
 			}
 			if len(seg.Payload) > 0 && seg.Header.SeqNum == conn.RCV_NXT {
@@ -404,10 +421,10 @@ func (ts *TCPState) advanceLastAck() {
 		acked := false
 
 		for _, seg := range conn.PendingSegs {
-			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
+			if seg.Header.IsACK() && seqGT(seg.Header.AckNum, conn.SND_UNA) {
 				conn.AckSendBuf(seg.Header.AckNum)
 				// Check if ACK covers our FIN
-				if seg.Header.AckNum >= conn.SND_NXT {
+				if seqGE(seg.Header.AckNum, conn.SND_NXT) {
 					acked = true
 				}
 			}
@@ -420,8 +437,12 @@ func (ts *TCPState) advanceLastAck() {
 			continue
 		}
 
-		// Resend FIN
-		ts.sendFIN(conn)
+		// Send FIN (only first time; timer-based retransmit)
+		if !conn.FinSent {
+			ts.sendFIN(conn)
+			conn.RetransmitAt = ts.tick + ts.msToTicks(200)
+			ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
+		}
 		conn.PendingSegs = nil
 	}
 }
@@ -442,7 +463,7 @@ func (ts *TCPState) advanceFinWait1() {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
 				// Our FIN was acked if the ACK covers our FIN seq = ISS+1+dataSent
-				if conn.FinSent && seg.Header.AckNum >= conn.SND_NXT {
+				if conn.FinSent && seqGE(seg.Header.AckNum, conn.SND_NXT) {
 					hasAckOfFin = true
 				}
 			}
@@ -640,7 +661,15 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 	if sentData {
 		conn.LastAckSent = conn.RCV_NXT
 		conn.LastAckWin = conn.scaledWindow(false)
-		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
+		// Exponential backoff: 200ms, 400ms, 800ms, ..., max 60s
+		base := int64(200)
+		for i := 0; i < conn.RetransmitCount && i < 10; i++ {
+			base *= 2
+		}
+		if base > 60000 {
+			base = 60000
+		}
+		conn.RetransmitAt = ts.tick + ts.msToTicks(base)
 		ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 		debug.Global.TCPInFlight.Store(int64(conn.SND_NXT - conn.SND_UNA))
 		debug.Global.TCPCanSend.Store(int64(mss))
@@ -716,7 +745,11 @@ func (ts *TCPState) needACK(conn *Conn) bool {
 }
 
 func (ts *TCPState) generateISN() uint32 {
-	return ts.rng.Uint32()
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return uint32(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint32(b[:])
 }
 
 func (ts *TCPState) msToTicks(ms int64) int64 {
@@ -735,7 +768,7 @@ func (ts *TCPState) checkInvariants() {
 	}
 	for _, coll := range all {
 		for tuple, conn := range coll {
-			if conn.SND_UNA > conn.SND_NXT {
+			if seqGT(conn.SND_UNA, conn.SND_NXT) {
 				panic("SND_UNA > SND_NXT in " + tuple.String())
 			}
 			if int(conn.SND_NXT-conn.SND_UNA) > conn.sendSize+2 {

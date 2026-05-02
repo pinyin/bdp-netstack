@@ -16,7 +16,7 @@ import (
 
 // TestFileTransferUploadDownload uploads 1MB, 10MB, and 100MB files to the VM
 // via SSH pipe, verifies SHA256 integrity, then downloads them back and verifies
-// again. Mirrors gvproxy's "upload and download with vfkit" test.
+// again. Mirrors gvproxy's "upload and download with vz-debug" test.
 func TestFileTransferUploadDownload(t *testing.T) {
 	env := setupE2E(t)
 	defer env.Cleanup()

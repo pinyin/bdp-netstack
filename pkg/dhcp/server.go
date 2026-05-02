@@ -264,10 +264,10 @@ func (s *Server) allocateIP(clientMAC [6]byte) net.IP {
 
 	// Allocate new IP from pool
 	poolStart := s.cfg.PoolStart.To4()
+	base := binary.BigEndian.Uint32(poolStart)
 	for i := 0; i < s.cfg.PoolSize; i++ {
 		ip := make(net.IP, 4)
-		copy(ip, poolStart)
-		ip[3] += byte(i)
+		binary.BigEndian.PutUint32(ip, base+uint32(i))
 
 		key := [4]byte{ip[0], ip[1], ip[2], ip[3]}
 		if !s.allocated[key] {

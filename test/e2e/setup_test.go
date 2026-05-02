@@ -25,7 +25,7 @@ type E2EEnv struct {
 	t          *testing.T
 }
 
-// setupE2E builds the stack, starts vfkit, and waits for SSH readiness.
+// setupE2E builds the stack, starts vz-debug, and waits for SSH readiness.
 func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 	t.Helper()
 
@@ -104,9 +104,9 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 	if err != nil {
 		t.Fatalf("create stack log: %v", err)
 	}
-	vfkitLog, err := os.Create(filepath.Join(tmpDir, "vfkit.log"))
+	vmLog, err := os.Create(filepath.Join(tmpDir, "vz-debug.log"))
 	if err != nil {
-		t.Fatalf("create vfkit log: %v", err)
+		t.Fatalf("create vz-debug log: %v", err)
 	}
 	logf := func(format string, args ...interface{}) {
 		msg := fmt.Sprintf("%s "+format+"\n", append([]interface{}{time.Now().Format("15:04:05.000")}, args...)...)
@@ -114,7 +114,7 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 		t.Logf(format, args...)
 	}
 	logf("=== TestE2EBasic starting ===")
-	logf("log files: e2e=%s, stack=%s/stack.log, vfkit=%s/vfkit.log", e2eLogPath, tmpDir, tmpDir)
+	logf("log files: e2e=%s, stack=%s/stack.log, vz-debug=%s/vz-debug.log", e2eLogPath, tmpDir, tmpDir)
 
 	// Start stack
 	ctx, cancel := context.WithCancel(context.Background())
@@ -179,8 +179,8 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 		"--console-log", consoleLogPath,
 	}
 	vmCmd := exec.CommandContext(ctx, vzDebugPath, vmArgs...)
-	vmCmd.Stderr = vfkitLog
-	vmCmd.Stdout = vfkitLog
+	vmCmd.Stderr = vmLog
+	vmCmd.Stdout = vmLog
 	logf("starting vz-debug: %s %v", vzDebugPath, vmArgs)
 	if err := vmCmd.Start(); err != nil {
 		logf("FAIL: start vz-debug: %v", err)
@@ -200,28 +200,38 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 		t:          t,
 	}
 
-	// Wait for SSH
+	// Wait for SSH. Use Output() (stdout only) because SSH prints
+	// warnings like "Permanently added ... to known hosts" on stderr,
+	// which would prevent CombinedOutput from matching "root".
 	logf("waiting for SSH on 127.0.0.1:%d...", sshPort)
 	sshReady := false
-	for i := 0; i < 120; i++ {
+	for i := 0; i < 90; i++ {
 		cmd := env.SSHCommand("whoami")
 		out, err := cmd.Output()
-		if err == nil && string(out) == sshUser+"\n" {
+		if err == nil && strings.TrimSpace(string(out)) == sshUser {
 			sshReady = true
-			logf("SSH ready at attempt %d (%.0fs)", i+1, float64(i+1)*2)
+			logf("SSH ready at attempt %d (%.0fs)", i+1, float64(i+1))
 			break
 		}
-		if i < 10 || i%15 == 0 {
+		if i < 15 || i%15 == 0 {
 			errStr := ""
 			if err != nil {
 				errStr = fmt.Sprintf(" err=%v", err)
+				// Re-run with CombinedOutput for stderr diagnostics
+				if diagOut, _ := env.SSHCommand("whoami").CombinedOutput(); len(diagOut) > 0 {
+					out = diagOut
+				}
 			}
-			logf("SSH attempt %d/%d%s", i+1, 120, errStr)
+			outStr := strings.TrimSpace(string(out))
+			if len(outStr) > 80 {
+				outStr = outStr[:80] + "..."
+			}
+			logf("SSH attempt %d/90%s out=%q", i+1, errStr, outStr)
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 	if !sshReady {
-		logf("FAIL: SSH never became available after 120 attempts")
+		logf("FAIL: SSH never became available after 90 attempts")
 		env.Cleanup()
 		t.Fatal("SSH never became available")
 	}
@@ -256,7 +266,7 @@ func (e *E2EEnv) Cleanup() {
 	e.Cancel()
 	e.t.Logf("Logs preserved at: /tmp/bdp-e2e-test.log")
 	if e.TmpDir != "" {
-		e.t.Logf("Stack+vfkit logs at: %s/", e.TmpDir)
+		e.t.Logf("Stack+vz-debug logs at: %s/", e.TmpDir)
 		// Keep tmpDir for post-mortem; OS cleans /tmp eventually
 	}
 }
@@ -363,8 +373,8 @@ func (e *E2EEnv) downloadFile(vmPath, localPath string) error {
 
 	cmd := e.SSHCommand(fmt.Sprintf("cat %s", vmPath))
 	cmd.Stdout = f
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("download %s: %v\n%s", vmPath, err, string(out))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("download %s: %v", vmPath, err)
 	}
 	return nil
 }

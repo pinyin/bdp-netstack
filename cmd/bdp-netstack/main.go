@@ -26,7 +26,7 @@ func main() {
 	subnetCIDR := flag.String("subnet", "192.168.65.0/24", "subnet CIDR")
 	bpt := flag.Duration("bpt", 1*time.Millisecond, "batch processing tick (BPT)")
 	mtu := flag.Int("mtu", 1500, "MTU")
-	bufSize := flag.Int("buf-size", 65536, "TCP buffer size")
+	bufSize := flag.Int("buf-size", 524288, "TCP buffer size (512KB)")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 

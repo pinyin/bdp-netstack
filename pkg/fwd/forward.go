@@ -114,7 +114,7 @@ func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
 				hostFD:   fd,
 				VMConn:   vmConn,
 				VMAddr:   vmAddr,
-				hostBuf:  make([]byte, 65536),
+				hostBuf:  make([]byte, 262144),
 			}
 
 			log.Printf("Forwarder: new connection :%d → %s", hostPort, vmAddr)
@@ -267,17 +267,35 @@ func (f *Forwarder) maybeClose(entry *Entry) {
 }
 
 // writeHost writes from VM receive buffer to host connection.
+// Uses PeekRecvData/ConsumeRecvData for zero-copy from RecvBuf.
 func (f *Forwarder) writeHost(entry *Entry) {
-	buf := entry.hostBuf
-	n := entry.VMConn.ReadRecvBuf(buf)
-	if n == 0 {
+	data := entry.VMConn.PeekRecvData()
+	if len(data) == 0 {
 		return
 	}
 
-	_, err := entry.HostConn.Write(buf[:n])
+	n, err := entry.HostConn.Write(data)
+	if n > 0 {
+		entry.VMConn.ConsumeRecvData(n)
+	}
 	if err != nil {
 		log.Printf("Forwarder: host write error: %v", err)
 		entry.HostClosed = true
+		return
+	}
+	// If data wrapped around the circular buffer, drain the remaining piece
+	if n == len(data) && entry.VMConn.RecvAvail() > 0 {
+		more := entry.VMConn.PeekRecvData()
+		if len(more) > 0 {
+			n2, err2 := entry.HostConn.Write(more)
+			if n2 > 0 {
+				entry.VMConn.ConsumeRecvData(n2)
+			}
+			if err2 != nil {
+				log.Printf("Forwarder: host write error (wrapped): %v", err2)
+				entry.HostClosed = true
+			}
+		}
 	}
 }
 

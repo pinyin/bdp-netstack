@@ -65,11 +65,14 @@ func ListenVFKit(socketPath string) (*VFKitConn, error) {
 	var controlErr error
 	rawConn.Control(func(f uintptr) {
 		fd = int(f)
-		// Increase send buffer to prevent ENOBUFS when bursting TCP
-		// segments (46 MSS × 1514 bytes ≈ 70KB per tick). 256KB gives
-		// enough headroom for a full 64KB TCP window plus framing.
-		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 256*1024); err != nil {
+		// Aligned with gvproxy: 1MB send, 4MB receive.
+		// SO_SNDBUF=1MB prevents ENOBUFS when bursting TCP segments.
+		// SO_RCVBUF=4MB prevents kernel drops on the VM→host path.
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1*1024*1024); err != nil {
 			log.Printf("VFKit: setsockopt SO_SNDBUF: %v", err)
+		}
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
+			log.Printf("VFKit: setsockopt SO_RCVBUF: %v", err)
 		}
 		// Set non-blocking before connect
 		syscall.SetNonblock(fd, true)

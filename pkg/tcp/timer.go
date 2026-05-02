@@ -27,6 +27,7 @@ func NewTimerWheel(slotSize time.Duration, numSlots int) *TimerWheel {
 		slots:    slots,
 		slotSize: slotSize,
 		numSlots: numSlots,
+		lastTick: time.Now().UnixNano() / int64(slotSize),
 	}
 }
 

@@ -402,6 +402,337 @@ func TestPreProcessACKsDoesNotCorruptSendBuf(t *testing.T) {
 	}
 }
 
+func TestZeroWindowFlowControl(t *testing.T) {
+	// Peer advertises WindowSize=0 → we must NOT send data.
+	// Regression: the old code had `if window == 0 { window = 65535 }`
+	// which ignored the peer's zero-window advertisement entirely.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Write data to send
+	ts.AppWrite(conn.Tuple, []byte("hello world"))
+	ts.Deliberate(time.Now())
+	outputs := ts.ConsumeOutputs()
+
+	// Should have sent data in the first round
+	var dataSent bool
+	for _, out := range outputs {
+		if len(out.Payload) > 0 {
+			dataSent = true
+		}
+	}
+	if !dataSent {
+		t.Fatal("expected data segments in first round")
+	}
+
+	// Peer ACKs our data but sets WindowSize=0 (closes the receive window).
+	// AckNum must cover the data we just sent.
+	ackSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, conn.SND_NXT, FlagACK, nil)
+	ackSeg.Header.WindowSize = 0
+	ts.InjectSegment(ackSeg)
+
+	// Write more data — this MUST NOT be sent because window is closed.
+	ts.AppWrite(conn.Tuple, []byte("more data"))
+	ts.Deliberate(time.Now())
+	outputs = ts.ConsumeOutputs()
+
+	for _, out := range outputs {
+		if len(out.Payload) > 0 {
+			t.Fatal("sent data despite zero-window advertisement from peer")
+		}
+	}
+
+	// Peer reopens window → data should flow again.
+	reopenSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, conn.SND_NXT, FlagACK, nil)
+	reopenSeg.Header.WindowSize = 65535
+	ts.InjectSegment(reopenSeg)
+	ts.Deliberate(time.Now())
+	outputs = ts.ConsumeOutputs()
+
+	dataSent = false
+	for _, out := range outputs {
+		if len(out.Payload) > 0 {
+			dataSent = true
+		}
+	}
+	if !dataSent {
+		t.Fatal("expected data after window reopened")
+	}
+}
+
+func TestLastAckFINAckDetection(t *testing.T) {
+	// ACK that covers data but NOT the FIN must not clean up the connection.
+	// Regression: advanceLastAck treated any ACK that advanced SND_UNA
+	// as acking the FIN (since FinSent is always true in LastAck).
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+	iss := conn.ISS
+
+	// Round 1: Send data. SND_NXT advances past ISS.
+	ts.AppWrite(conn.Tuple, []byte("hello"))
+	ts.Deliberate(time.Now())
+	ts.ConsumeOutputs()
+
+	sndNxtAfterData := conn.SND_NXT // ISS+1+5 = ISS+6
+
+	// Round 2: Peer sends standalone FIN without acking our data.
+	// AckNum=ISS+1 so SND_UNA stays at ISS+1.
+	finSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1001, iss+1, FlagACK|FlagFIN, nil)
+	ts.InjectSegment(finSeg)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.CloseWait[conn.Tuple]; !ok {
+		t.Fatalf("expected conn in CloseWait after peer FIN, got Established=%d CloseWait=%d",
+			len(ts.Established), len(ts.CloseWait))
+	}
+
+	// Round 3: AppClose + sendFIN.
+	ts.AppClose(conn.Tuple)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.LastAck[conn.Tuple]; !ok {
+		t.Fatalf("expected conn in LastAck after AppClose, got CloseWait=%d LastAck=%d",
+			len(ts.CloseWait), len(ts.LastAck))
+	}
+
+	sndNxtAfterFIN := conn.SND_NXT // sndNxtAfterData + 1
+
+	// Round 4: ACK covers our data (up to sndNxtAfterData) but NOT the FIN.
+	// The FIN seq is sndNxtAfterData, so an ACK with AckNum=sndNxtAfterData
+	// means "I received up to before the FIN; FIN is NOT acked."
+	dataOnlyAck := fakeSegment(vmIP, gwIP, 12345, 8080, 1002, sndNxtAfterData, FlagACK, nil)
+	ts.InjectSegment(dataOnlyAck)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.LastAck[conn.Tuple]; !ok {
+		t.Fatal("connection incorrectly cleaned up: ACK covered data but NOT the FIN")
+	}
+
+	// Round 5: ACK that covers the FIN (AckNum == sndNxtAfterFIN).
+	finAck := fakeSegment(vmIP, gwIP, 12345, 8080, 1002, sndNxtAfterFIN, FlagACK, nil)
+	ts.InjectSegment(finAck)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.LastAck[conn.Tuple]; ok {
+		t.Fatal("connection should be cleaned up after FIN is acked")
+	}
+	if ts.ConnectionCount() != 0 {
+		t.Fatalf("expected 0 connections, got %d", ts.ConnectionCount())
+	}
+}
+
+func TestEstablishedToCloseWaitPreservesData(t *testing.T) {
+	// Data arriving in the same batch as FIN must survive the
+	// Established→CloseWait transition.
+	// Regression: advanceEstablished set conn.PendingSegs=nil on
+	// state transition, discarding data that arrived with the FIN.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	doHandshake(t, ts, vmIP, gwIP, 12345, 8080)
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Inject a data segment and a FIN segment in the same batch.
+	// The data segment has SeqNum=RCV_NXT and the FIN follows it.
+	payload := []byte("data-before-fin")
+	dataSeg := fakeSegment(vmIP, gwIP, 12345, 8080, conn.RCV_NXT, conn.ISS+1, FlagACK, payload)
+	finSeq := conn.RCV_NXT + uint32(len(payload))
+	finSeg := fakeSegment(vmIP, gwIP, 12345, 8080, finSeq, conn.ISS+1, FlagACK|FlagFIN, nil)
+	ts.InjectSegment(dataSeg)
+	ts.InjectSegment(finSeg)
+
+	ts.Deliberate(time.Now())
+
+	// Connection should be in CloseWait
+	if _, ok := ts.CloseWait[conn.Tuple]; !ok {
+		t.Fatalf("expected conn in CloseWait, got Established=%d CloseWait=%d",
+			len(ts.Established), len(ts.CloseWait))
+	}
+
+	// Data must be readable from RecvBuf
+	if conn.RecvAvail() != len(payload) {
+		t.Fatalf("data lost during Established→CloseWait: RecvAvail=%d, expected %d",
+			conn.RecvAvail(), len(payload))
+	}
+	buf := make([]byte, 1024)
+	n := conn.ReadRecvBuf(buf)
+	if n != len(payload) || string(buf[:n]) != string(payload) {
+		t.Fatalf("RecvBuf content wrong: got %q, expected %q", buf[:n], payload)
+	}
+}
+
+func TestFinWait1FINAckAfterData(t *testing.T) {
+	// FIN ack detection must work correctly when data was sent before FIN.
+	// Regression: used `AckNum > ISS+1` heuristic which is wrong when
+	// SND_NXT has advanced past ISS+1 due to data bytes.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	doHandshake(t, ts, vmIP, gwIP, 12346, 8080)
+
+	var conn *Conn
+	for _, c := range ts.Established {
+		conn = c
+		break
+	}
+
+	// Write data then close — data is sent before FIN in the same round.
+	ts.AppWrite(conn.Tuple, []byte("hello"))
+	ts.AppClose(conn.Tuple)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.FinWait1[conn.Tuple]; !ok {
+		t.Fatalf("expected conn in FinWait1 after AppClose, got FinWait1=%d",
+			len(ts.FinWait1))
+	}
+
+	sndNxtAfterFIN := conn.SND_NXT // ISS+1+5+1 = ISS+7
+
+	// ACK covers data (5 bytes) but NOT the FIN.
+	// AckNum = ISS+6. FIN is at seq ISS+6 (ISS+1+5).
+	// AckNum=ISS+6 means "next expected is ISS+6" — the FIN is NOT acked.
+	dataOnlyAck := fakeSegment(vmIP, gwIP, 12346, 8080, 1001, sndNxtAfterFIN-1, FlagACK, nil)
+	ts.InjectSegment(dataOnlyAck)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.FinWait1[conn.Tuple]; !ok {
+		t.Fatal("FIN_WAIT1→FIN_WAIT2 transition triggered by data-only ACK; FIN was not acked")
+	}
+
+	// ACK that covers the FIN.
+	finAck := fakeSegment(vmIP, gwIP, 12346, 8080, 1001, sndNxtAfterFIN, FlagACK, nil)
+	ts.InjectSegment(finAck)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.FinWait2[conn.Tuple]; !ok {
+		t.Fatal("FIN_WAIT1→FIN_WAIT2 expected after FIN ack")
+	}
+}
+
+func TestTimerWheelLastTickInit(t *testing.T) {
+	// TimerWheel.lastTick starts at 0. Verify the first Expired() call
+	// does not incorrectly expire timers scheduled after initialization.
+	// Regression: lastTick defaulted to 0, causing the first Expired()
+	// to scan all slots from 0 to currentTick, expiring everything.
+	tw := NewTimerWheel(10*time.Millisecond, 100)
+
+	// Advance to "now" and THEN schedule a timer at tick+10.
+	now := time.Now()
+	tick := tw.Advance(now)
+
+	// Schedule a timer far in the future.
+	futureTuple := Tuple{SrcPort: 1, DstPort: 2}
+	tw.Schedule(futureTuple, tick+100)
+
+	// Expired should return nothing — our timer is far in the future.
+	expired := tw.Expired(tick)
+	if len(expired) != 0 {
+		t.Fatalf("Expired returned %d tuples, expected 0 (lastTick was not initialized)", len(expired))
+	}
+
+	// Advance much further — now the timer should fire.
+	farTick := tick + 200
+	expired = tw.Expired(farTick)
+	found := false
+	for _, e := range expired {
+		if e == futureTuple {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("timer scheduled at tick+100 did not fire at tick+200")
+	}
+}
+
+func TestRecvDataIncludesSynRcvd(t *testing.T) {
+	// RecvData must find connections in SynRcvd, since RFC 793 allows
+	// data in SYN-ACK segments. Regression: SynRcvd was missing from
+	// the state collections searched by RecvData.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {})
+
+	vmIP := net.ParseIP("192.168.65.2")
+	gwIP := net.ParseIP("192.168.65.1")
+
+	// Initiate handshake: VM sends SYN, we reply SYN-ACK.
+	// Connection is now in SynRcvd.
+	synSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1000, 0, FlagSYN, nil)
+	ts.InjectSegment(synSeg)
+	ts.Deliberate(time.Now())
+
+	if len(ts.SynRcvd) != 1 {
+		t.Fatalf("expected 1 SynRcvd, got %d", len(ts.SynRcvd))
+	}
+
+	// Manually inject data into the SynRcvd connection's RecvBuf, simulating
+	// data that arrived with the SYN (unusual but RFC-permitted).
+	var conn *Conn
+	for _, c := range ts.SynRcvd {
+		conn = c
+		break
+	}
+	conn.WriteRecvBuf([]byte("early-data"))
+
+	// RecvData should be able to read this data.
+	tuple := conn.Tuple
+	buf := make([]byte, 1024)
+	n := ts.RecvData(tuple, buf)
+	if n != 10 {
+		t.Fatalf("RecvData returned %d bytes from SynRcvd conn, expected 10", n)
+	}
+	if string(buf[:n]) != "early-data" {
+		t.Fatalf("RecvData returned %q, expected %q", buf[:n], "early-data")
+	}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================

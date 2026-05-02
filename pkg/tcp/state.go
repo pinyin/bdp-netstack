@@ -27,15 +27,17 @@ type Config struct {
 	MTU         int           // max TCP payload per segment
 	IdleTimeout time.Duration // idle connection timeout (0 = no timeout)
 	MaxSegsPerTick int        // max data segments per tick (0 = default 64)
+	WindowScale    uint8      // RFC 1323 window scale shift (0 = disabled, 7 = 128x)
 }
 
 func DefaultConfig() Config {
 	return Config{
 		BPT:            1 * time.Millisecond,
-		BufferSize:     64 * 1024,
+		BufferSize:     512 * 1024,
 		MTU:            1400,         // 1500 - IP header - TCP header
 		IdleTimeout:    30 * time.Minute,
-		MaxSegsPerTick: 64,
+		MaxSegsPerTick: 128,
+		WindowScale:    7,            // 128x, effective window up to 8MB
 	}
 }
 
@@ -157,7 +159,7 @@ func (ts *TCPState) PreProcessACKs() {
 			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
 				ackDelta := seg.Header.AckNum - conn.SND_UNA
 				conn.AckSendBuf(seg.Header.AckNum) // updates SND_UNA by min(ackDelta, sendSize)
-				conn.SND_WND = uint32(seg.Header.WindowSize)
+				conn.SND_WND = uint32(seg.Header.WindowSize) << conn.SndShift
 				if ackDelta > 1000 {
 					log.Printf("PRE-ACK: %s ack=%d→%d (+%d) win=%d sendSize=%d",
 						tuple, seg.Header.AckNum-ackDelta, seg.Header.AckNum,
@@ -187,7 +189,7 @@ func (ts *TCPState) ConsumeOutputs() []*TCPSegment {
 
 // RecvData reads received data from a connection's buffer.
 func (ts *TCPState) RecvData(tuple Tuple, buf []byte) int {
-	for _, coll := range []map[Tuple]*Conn{ts.SynSent, ts.Established, ts.CloseWait, ts.LastAck, ts.FinWait1, ts.FinWait2} {
+	for _, coll := range []map[Tuple]*Conn{ts.SynSent, ts.SynRcvd, ts.Established, ts.CloseWait, ts.LastAck, ts.FinWait1, ts.FinWait2} {
 		if conn, ok := coll[tuple]; ok {
 			return conn.ReadRecvBuf(buf)
 		}
@@ -207,11 +209,17 @@ func (ts *TCPState) ConnectionCount() int {
 // tuple should already be in response direction (Ext_IP:Ext_Port → VM_IP:VM_Port)
 // as the NAT module reverses the segment tuple before calling this.
 // irs is the initial receive sequence (VM's SEQ from the intercepted SYN).
-func (ts *TCPState) CreateExternalConn(tuple Tuple, irs uint32, window uint16) *Conn {
+// rawSeg is the raw bytes of the VM's SYN segment (for parsing TCP options).
+func (ts *TCPState) CreateExternalConn(tuple Tuple, irs uint32, window uint16, rawSeg []byte) *Conn {
 	iss := ts.generateISN()
 	conn := NewConn(tuple, irs, iss, window, ts.cfg.BufferSize)
 	conn.LastActivityTick = ts.tick
 	conn.RetransmitAt = ts.tick + ts.msToTicks(200)
+	// Parse window scale from SYN options (RFC 1323)
+	if ws := ParseWindowScale(rawSeg); ws > 0 {
+		conn.SndShift = ws
+	}
+	conn.RcvShift = ts.cfg.WindowScale
 	ts.SynRcvd[tuple] = conn
 	return conn
 }
@@ -225,6 +233,7 @@ func (ts *TCPState) ActiveOpen(tuple Tuple, vmWindow uint16) *Conn {
 	conn := NewConn(tuple, 0, iss, vmWindow, ts.cfg.BufferSize)
 	conn.LastActivityTick = ts.tick
 	conn.RetransmitAt = ts.tick + ts.msToTicks(200)
+	conn.RcvShift = ts.cfg.WindowScale
 	ts.SynSent[tuple] = conn
 	return conn
 }

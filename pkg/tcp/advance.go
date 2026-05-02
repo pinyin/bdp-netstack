@@ -113,12 +113,10 @@ func (ts *TCPState) processAppRequests() {
 		if conn := ts.findConnInState(tuple, ts.Established); conn != nil {
 			// Active close (we initiate): Established → FinWait1
 			delete(ts.Established, tuple)
-			conn.FinSent = true
 			ts.FinWait1[tuple] = conn
 		} else if conn := ts.findConnInState(tuple, ts.CloseWait); conn != nil {
 			// Passive close (peer FIN first, then app closes): CloseWait → LastAck
 			delete(ts.CloseWait, tuple)
-			conn.FinSent = true
 			ts.LastAck[tuple] = conn
 		}
 	}
@@ -293,9 +291,14 @@ func (ts *TCPState) advanceEstablished() {
 
 		for _, seg := range conn.PendingSegs {
 			// Process ACK
-			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
-				conn.AckSendBuf(seg.Header.AckNum)
-				conn.SND_WND = uint32(seg.Header.WindowSize)
+			if seg.Header.IsACK() {
+				if seg.Header.AckNum > conn.SND_UNA {
+					conn.AckSendBuf(seg.Header.AckNum)
+				}
+				// Update window even for pure window updates (AckNum == SND_UNA)
+				if seg.Header.AckNum >= conn.SND_UNA {
+					conn.SND_WND = uint32(seg.Header.WindowSize)
+				}
 			}
 
 			// Process data
@@ -353,8 +356,13 @@ func (ts *TCPState) advanceCloseWait() {
 	for tuple, conn := range ts.CloseWait {
 		// Process remaining data/ACKs from peer
 		for _, seg := range conn.PendingSegs {
-			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
-				conn.AckSendBuf(seg.Header.AckNum)
+			if seg.Header.IsACK() {
+				if seg.Header.AckNum > conn.SND_UNA {
+					conn.AckSendBuf(seg.Header.AckNum)
+				}
+				if seg.Header.AckNum >= conn.SND_UNA {
+					conn.SND_WND = uint32(seg.Header.WindowSize)
+				}
 			}
 			if len(seg.Payload) > 0 && seg.Header.SeqNum == conn.RCV_NXT {
 				n := conn.WriteRecvBuf(seg.Payload)
@@ -389,7 +397,7 @@ func (ts *TCPState) advanceLastAck() {
 			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
 				conn.AckSendBuf(seg.Header.AckNum)
 				// Check if ACK covers our FIN
-				if conn.FinSent {
+				if seg.Header.AckNum >= conn.SND_NXT {
 					acked = true
 				}
 			}
@@ -424,7 +432,7 @@ func (ts *TCPState) advanceFinWait1() {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
 				// Our FIN was acked if the ACK covers our FIN seq = ISS+1+dataSent
-				if conn.FinSent && seg.Header.AckNum > conn.ISS+1 {
+				if conn.FinSent && seg.Header.AckNum >= conn.SND_NXT {
 					hasAckOfFin = true
 				}
 			}
@@ -576,9 +584,6 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 		}
 		inFlight := conn.SND_NXT - conn.SND_UNA
 		window := conn.SND_WND
-		if window == 0 {
-			window = 65535
-		}
 		canSend := int(window) - int(inFlight)
 		if canSend <= 0 {
 			break // window full
@@ -675,7 +680,9 @@ func (ts *TCPState) sendFIN(conn *Conn) {
 		ts.outputs = append(ts.outputs, seg)
 	}
 
-	conn.SND_NXT++
+	if !conn.FinSent {
+		conn.SND_NXT++
+	}
 	conn.FinSent = true
 }
 

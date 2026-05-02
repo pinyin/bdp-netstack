@@ -190,6 +190,10 @@ type Conn struct {
 	// Idle tracking
 	LastActivityTick int64 // tick of last data or ACK received
 
+	// Window scaling (RFC 1323)
+	SndShift uint8 // peer's window scale (received in SYN/SYN-ACK, applied to SND_WND)
+	RcvShift uint8 // our window scale (sent in SYN/SYN-ACK, applied to advertised WindowSize)
+
 	// Close tracking
 	FinSent     bool
 	FinReceived bool
@@ -221,13 +225,11 @@ func NewConn(tuple Tuple, irs uint32, iss uint32, window uint16, bufSize int) *C
 func (c *Conn) RecvAvail() int { return c.recvSize }
 
 // RecvWritable returns how many bytes can still be written to RecvBuf.
-// Capped at 65535 (max TCP window size) to prevent uint16 truncation to zero.
+// With window scaling (RcvShift > 0), the value is right-shifted before being
+// placed in the uint16 WindowSize field. The cap is applied post-shift in
+// scaledWindow().
 func (c *Conn) RecvWritable() int {
-	n := len(c.RecvBuf) - c.recvSize
-	if n > 65535 {
-		n = 65535
-	}
-	return n
+	return len(c.RecvBuf) - c.recvSize
 }
 
 // WriteRecvBuf writes data into the receive buffer.
@@ -260,6 +262,30 @@ func (c *Conn) ReadRecvBuf(buf []byte) int {
 	c.recvHead = (c.recvHead + n) % len(c.RecvBuf)
 	c.recvSize -= n
 	return n
+}
+
+// PeekRecvData returns a slice of received data without copying.
+// For use by zero-copy consumers (e.g. forwarder writeHost).
+// The caller must call ConsumeRecvData after consuming the data.
+func (c *Conn) PeekRecvData() []byte {
+	if c.recvSize == 0 {
+		return nil
+	}
+	end := c.recvHead + c.recvSize
+	if end <= len(c.RecvBuf) {
+		return c.RecvBuf[c.recvHead:end]
+	}
+	return c.RecvBuf[c.recvHead:]
+}
+
+// ConsumeRecvData advances the read pointer by n bytes.
+// Must be called after PeekRecvData.
+func (c *Conn) ConsumeRecvData(n int) {
+	if n <= 0 || n > c.recvSize {
+		return
+	}
+	c.recvHead = (c.recvHead + n) % len(c.RecvBuf)
+	c.recvSize -= n
 }
 
 // SendAvail returns the number of bytes available to send (data in buffer).
@@ -302,6 +328,8 @@ func (c *Conn) AckSendBuf(seq uint32) {
 // PeekSendData returns a slice of data ready to send, limited by window.
 // Skips bytes that have already been sent but not yet acknowledged
 // (tracked by SND_NXT - SND_UNA).
+// Returns a slice directly into SendBuf (no copy). The caller must consume
+// the data before modifying SendBuf (via AckSendBuf or WriteSendBuf).
 func (c *Conn) PeekSendData(max int) []byte {
 	avail := c.SendAvail()
 	sent := int(c.SND_NXT - c.SND_UNA)
@@ -316,11 +344,13 @@ func (c *Conn) PeekSendData(max int) []byte {
 	if n > max {
 		n = max
 	}
-	data := make([]byte, n)
 	start := (c.sendHead + sent) % len(c.SendBuf)
-	first := copy(data, c.SendBuf[start:start+min(n, len(c.SendBuf)-start)])
-	copy(data[first:n], c.SendBuf)
-	return data
+	end := start + n
+	if end <= len(c.SendBuf) {
+		return c.SendBuf[start:end]
+	}
+	// Data wraps around; return only the first contiguous piece.
+	return c.SendBuf[start:]
 }
 
 // Server API types
@@ -337,22 +367,83 @@ type AppData struct {
 // ============================================================================
 
 func BuildSegment(tuple Tuple, seq, ack uint32, flags uint8, window uint16, payload []byte) []byte {
-	h := &TCPHeader{
-		SrcPort:    tuple.SrcPort,
-		DstPort:    tuple.DstPort,
-		SeqNum:     seq,
-		AckNum:     ack,
-		Flags:      flags,
-		WindowSize: window,
+	return buildSegment(tuple, seq, ack, flags, window, 0, payload)
+}
+
+// BuildSegmentWithWScale builds a TCP segment with the Window Scale option
+// (RFC 1323). Only meaningful for SYN and SYN-ACK segments. Pass scale=0
+// for segments that should not include the option.
+func BuildSegmentWithWScale(tuple Tuple, seq, ack uint32, flags uint8, window uint16, scale uint8, payload []byte) []byte {
+	return buildSegment(tuple, seq, ack, flags, window, scale, payload)
+}
+
+func buildSegment(tuple Tuple, seq, ack uint32, flags uint8, window uint16, scale uint8, payload []byte) []byte {
+	hasOptions := scale > 0
+	headerLen := 20
+	if hasOptions {
+		headerLen = 24 // 20 + 4 bytes options (WS:3 + NOP:1)
 	}
-	headerBytes := h.Marshal()
+
+	d := make([]byte, headerLen)
+	binary.BigEndian.PutUint16(d[0:2], tuple.SrcPort)
+	binary.BigEndian.PutUint16(d[2:4], tuple.DstPort)
+	binary.BigEndian.PutUint32(d[4:8], seq)
+	binary.BigEndian.PutUint32(d[8:12], ack)
+	d[12] = uint8(headerLen/4) << 4 // DataOffset in 4-byte words
+	d[13] = flags
+	binary.BigEndian.PutUint16(d[14:16], window)
+	binary.BigEndian.PutUint16(d[16:18], 0) // checksum placeholder
+	binary.BigEndian.PutUint16(d[18:20], 0) // urgent pointer
+
+	if hasOptions {
+		d[20] = 3  // Kind: Window Scale
+		d[21] = 3  // Length: 3
+		d[22] = scale
+		d[23] = 1  // NOP (align to 4-byte boundary)
+	}
+
 	if len(payload) > 0 {
-		result := make([]byte, 20+len(payload))
-		copy(result[:20], headerBytes)
-		copy(result[20:], payload)
+		result := make([]byte, headerLen+len(payload))
+		copy(result[:headerLen], d)
+		copy(result[headerLen:], payload)
 		return result
 	}
-	return headerBytes
+	return d
+}
+
+// ParseWindowScale extracts the window scale factor from TCP options in a
+// SYN or SYN-ACK segment. Returns 0 if not present or data is too short.
+func ParseWindowScale(data []byte) uint8 {
+	if len(data) < 20 {
+		return 0
+	}
+	dataOffset := (data[12] >> 4) * 4
+	if dataOffset <= 20 {
+		return 0
+	}
+	options := data[20:dataOffset]
+	for i := 0; i < len(options); {
+		if options[i] == 0 { // End of Option List
+			break
+		}
+		if options[i] == 1 { // NOP
+			i++
+			continue
+		}
+		if i+1 >= len(options) {
+			break
+		}
+		kind := options[i]
+		length := options[i+1]
+		if length < 2 || i+int(length) > len(options) {
+			break
+		}
+		if kind == 3 && length == 3 {
+			return options[i+2]
+		}
+		i += int(length)
+	}
+	return 0
 }
 
 // ============================================================================

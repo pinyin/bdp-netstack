@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/debug"
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
@@ -50,8 +51,9 @@ type Table struct {
 }
 
 type pendingDial struct {
-	Entry *Entry
-	Seg   *tcp.TCPSegment
+	Entry   *Entry
+	Seg     *tcp.TCPSegment
+	dialing chan struct{} // closed when dial completes
 }
 
 // NewTable creates a new NAT connection tracking table.
@@ -80,11 +82,11 @@ func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
 			Key:     tuple,
 			ExtIP:   seg.Tuple.DstIPNet(),
 			ExtPort: seg.Tuple.DstPort,
-			hostBuf: make([]byte, 65536),
+			hostBuf: make([]byte, 262144),
 		}
 
 		// Create the VM-facing TCP connection in our stack
-		entry.VMConn = tcpState.CreateExternalConn(tuple, seg.Header.SeqNum, seg.Header.WindowSize)
+		entry.VMConn = tcpState.CreateExternalConn(tuple, seg.Header.SeqNum, seg.Header.WindowSize, seg.Raw)
 
 		t.entries[tuple] = entry
 
@@ -100,15 +102,25 @@ func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
 	return false
 }
 
-// PollDials processes pending host dials only. Called BEFORE TCP deliberation
-// so new connections have their host-side TCP socket ready.
-// This is separated from PollReads because reads MUST happen after TCP
-// deliberation (which processes VM ACKs and frees SendBuf space).
+// PollDials processes pending host dials. Dials are started asynchronously
+// to avoid blocking the BDP deliberation loop on remote TCP connects.
+// Completed dials are detected via a channel and removed from the pending list.
 func (t *Table) PollDials() {
+	var remaining []*pendingDial
 	for _, pd := range t.pendingDials {
-		t.doDial(pd)
+		if pd.dialing == nil {
+			// Start a new async dial
+			t.doDial(pd)
+		}
+		// Check if dial has completed
+		select {
+		case <-pd.dialing:
+			// Dial completed (HostConn/hostFD set by goroutine)
+		default:
+			remaining = append(remaining, pd)
+		}
 	}
-	t.pendingDials = nil
+	t.pendingDials = remaining
 }
 
 // PollReads performs non-blocking reads from all host connections.
@@ -165,31 +177,37 @@ func (t *Table) Cleanup() {
 	}
 }
 
-// doDial initiates a host TCP connection.
+// doDial starts an asynchronous host TCP connection.
+// The goroutine sets entry.HostConn and entry.hostFD on success,
+// or entry.VMClosed on failure. The dialing channel is closed when done.
 func (t *Table) doDial(pd *pendingDial) {
+	pd.dialing = make(chan struct{})
 	entry := pd.Entry
 	addr := net.JoinHostPort(entry.ExtIP.String(), fmt.Sprintf("%d", entry.ExtPort))
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		log.Printf("NAT: dial %s failed: %v", addr, err)
-		// Send RST to VM through the TCP stack
-		entry.VMClosed = true
-		return
-	}
+	go func() {
+		defer close(pd.dialing)
 
-	entry.HostConn = conn
-
-	// Set non-blocking for BDP integration
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		rawConn, err := tcpConn.SyscallConn()
-		if err == nil {
-			rawConn.Control(func(fd uintptr) {
-				entry.hostFD = int(fd)
-				syscall.SetNonblock(entry.hostFD, true)
-			})
+		conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+		if err != nil {
+			log.Printf("NAT: dial %s failed: %v", addr, err)
+			entry.VMClosed = true
+			return
 		}
-	}
+
+		entry.HostConn = conn
+
+		// Set non-blocking for BDP integration
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			rawConn, err := tcpConn.SyscallConn()
+			if err == nil {
+				rawConn.Control(func(fd uintptr) {
+					entry.hostFD = int(fd)
+					syscall.SetNonblock(entry.hostFD, true)
+				})
+			}
+		}
+	}()
 }
 
 // readHost reads available data from a host connection (non-blocking).
@@ -248,17 +266,35 @@ func (t *Table) maybeClose(entry *Entry) {
 }
 
 // writeHost writes data from VM receive buffer to host connection.
+// Uses PeekRecvData/ConsumeRecvData for zero-copy from RecvBuf.
 func (t *Table) writeHost(entry *Entry) {
-	buf := entry.hostBuf
-	n := entry.VMConn.ReadRecvBuf(buf)
-	if n == 0 {
+	data := entry.VMConn.PeekRecvData()
+	if len(data) == 0 {
 		return
 	}
 
-	_, err := entry.HostConn.Write(buf[:n])
+	n, err := entry.HostConn.Write(data)
+	if n > 0 {
+		entry.VMConn.ConsumeRecvData(n)
+	}
 	if err != nil {
 		log.Printf("NAT: host write error: %v", err)
 		entry.HostClosed = true
+		return
+	}
+	// If data wrapped around the circular buffer, drain the remaining piece
+	if n == len(data) && entry.VMConn.RecvAvail() > 0 {
+		more := entry.VMConn.PeekRecvData()
+		if len(more) > 0 {
+			n2, err2 := entry.HostConn.Write(more)
+			if n2 > 0 {
+				entry.VMConn.ConsumeRecvData(n2)
+			}
+			if err2 != nil {
+				log.Printf("NAT: host write error (wrapped): %v", err2)
+				entry.HostClosed = true
+			}
+		}
 	}
 }
 

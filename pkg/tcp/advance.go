@@ -702,3 +702,31 @@ func (ts *TCPState) generateISN() uint32 {
 func (ts *TCPState) msToTicks(ms int64) int64 {
 	return ms * int64(time.Millisecond) / int64(ts.timerWheel.SlotDuration())
 }
+
+// checkInvariants validates consistency across all connections.
+// A correct implementation should never trip these. When one fires,
+// panicking immediately prevents state corruption from cascading into
+// confusing misbehavior many ticks later. The cost is a few integer
+// comparisons per connection — negligible in batch traversal.
+func (ts *TCPState) checkInvariants() {
+	all := []map[Tuple]*Conn{
+		ts.SynSent, ts.SynRcvd, ts.Established, ts.CloseWait, ts.LastAck,
+		ts.FinWait1, ts.FinWait2, ts.TimeWait,
+	}
+	for _, coll := range all {
+		for tuple, conn := range coll {
+			if conn.SND_UNA > conn.SND_NXT {
+				panic("SND_UNA > SND_NXT in " + tuple.String())
+			}
+			if int(conn.SND_NXT-conn.SND_UNA) > conn.sendSize+2 {
+				panic("inflight exceeds sendSize+2 in " + tuple.String())
+			}
+			if conn.sendSize < 0 || conn.sendSize > len(conn.SendBuf) {
+				panic("sendSize out of bounds in " + tuple.String())
+			}
+			if conn.recvSize < 0 || conn.recvSize > len(conn.RecvBuf) {
+				panic("recvSize out of bounds in " + tuple.String())
+			}
+		}
+	}
+}

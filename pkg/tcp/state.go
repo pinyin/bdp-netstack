@@ -260,4 +260,6 @@ func (ts *TCPState) Deliberate(now time.Time) {
 
 	// Phase 5: Cleanup closed connections
 	ts.reclaimClosed()
+
+	ts.checkInvariants()
 }

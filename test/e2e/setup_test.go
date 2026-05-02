@@ -55,11 +55,25 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 			"  cd test/image && ./build.sh", candidates)
 	}
 
-	privateKeyFile := filepath.Join(imageDir, "test_key")
-	if _, err := os.Stat(privateKeyFile); err != nil {
-		t.Fatalf("SSH test key not found: %s", privateKeyFile)
+	// Copy SSH key to local temp — avoids NFS attribute hangs
+	srcKeyPath := filepath.Join(imageDir, "test_key")
+	keyData, err := os.ReadFile(srcKeyPath)
+	if err != nil {
+		t.Fatalf("SSH test key not found at %s: %v", imageDir, err)
 	}
-	os.Chmod(privateKeyFile, 0600)
+	localKey, err := os.CreateTemp("", "bdp-e2e-key-*")
+	if err != nil {
+		t.Fatalf("create temp key file: %v", err)
+	}
+	localKeyPath := localKey.Name()
+	if _, err := localKey.Write(keyData); err != nil {
+		localKey.Close()
+		os.Remove(localKeyPath)
+		t.Fatalf("write temp key: %v", err)
+	}
+	localKey.Close()
+	os.Chmod(localKeyPath, 0600)
+	privateKeyFile := localKeyPath
 
 	// Clean leftovers
 	os.Remove(sockPath)

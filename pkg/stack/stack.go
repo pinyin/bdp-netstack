@@ -180,6 +180,15 @@ func (s *Stack) Run(ctx context.Context) error {
 
 // deliberate executes one full round of batch processing.
 func (s *Stack) deliberate(now time.Time) {
+	if s.cfg.Debug {
+		start := time.Now()
+		defer func() {
+			if elapsed := time.Since(start); elapsed > 2*s.cfg.BPT {
+				log.Printf("slow tick: %v (threshold=%v)", elapsed, 2*s.cfg.BPT)
+			}
+		}()
+	}
+
 	// Phase 1: Read all available Ethernet frames (externalization)
 	if s.conn != nil {
 		frames, err := s.conn.ReadAllFrames(context.TODO())

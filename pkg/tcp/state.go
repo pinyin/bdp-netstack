@@ -187,6 +187,13 @@ func (ts *TCPState) ConsumeOutputs() []*TCPSegment {
 	return out
 }
 
+// HasConn returns true if a connection with the given tuple exists in any
+// state collection. Used by the forwarder to detect when AppClose has
+// removed a connection from all collections (cleanup).
+func (ts *TCPState) HasConn(tuple Tuple) bool {
+	return ts.findConn(tuple) != nil
+}
+
 // RecvData reads received data from a connection's buffer.
 func (ts *TCPState) RecvData(tuple Tuple, buf []byte) int {
 	for _, coll := range []map[Tuple]*Conn{ts.SynSent, ts.SynRcvd, ts.Established, ts.CloseWait, ts.LastAck, ts.FinWait1, ts.FinWait2} {

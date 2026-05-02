@@ -1,16 +1,29 @@
 package fwd
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
 	"github.com/pinyin/bdp-netstack/pkg/tcp"
 )
 
+// freePort returns an available TCP port on localhost.
+func freePort() int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
 func TestForwarderNew(t *testing.T) {
+	p1, p2 := freePort(), freePort()
 	mappings := []Mapping{
-		{HostPort: 2222, VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
-		{HostPort: 8080, VMIP: net.ParseIP("192.168.65.2"), VMPort: 80},
+		{HostPort: uint16(p1), VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
+		{HostPort: uint16(p2), VMIP: net.ParseIP("192.168.65.2"), VMPort: 80},
 	}
 
 	f, err := New(net.ParseIP("192.168.65.1"), mappings)
@@ -32,8 +45,9 @@ func TestForwarderNew(t *testing.T) {
 }
 
 func TestForwarderAccept(t *testing.T) {
+	port := freePort()
 	mappings := []Mapping{
-		{HostPort: 2223, VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
+		{HostPort: uint16(port), VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
 	}
 
 	f, err := New(net.ParseIP("192.168.65.1"), mappings)
@@ -51,7 +65,7 @@ func TestForwarderAccept(t *testing.T) {
 	ts := tcp.NewTCPState(tsCfg)
 
 	// Dial the forwarded port
-	conn, err := net.Dial("tcp", "127.0.0.1:2223")
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -73,8 +87,9 @@ func TestForwarderAccept(t *testing.T) {
 }
 
 func TestForwarderCleanup(t *testing.T) {
+	port := freePort()
 	mappings := []Mapping{
-		{HostPort: 2224, VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
+		{HostPort: uint16(port), VMIP: net.ParseIP("192.168.65.2"), VMPort: 22},
 	}
 
 	f, err := New(net.ParseIP("192.168.65.1"), mappings)

@@ -754,6 +754,78 @@ func fakeSegment(srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, 
 	}
 }
 
+func TestAppCloseSynSent(t *testing.T) {
+	// Regression: AppClose on SynSent was silently ignored because
+	// processAppRequests only handled Established and CloseWait.
+	// When the host closes before the TCP handshake completes
+	// (e.g., SYN dropped due to ARP miss), the connection must be
+	// removed immediately since no TCP connection was established.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+
+	gwIP := net.ParseIP("192.168.65.1")
+	vmIP := net.ParseIP("192.168.65.2")
+	tuple := NewTuple(gwIP, vmIP, 32769, 22)
+
+	// ActiveOpen puts it in SynSent
+	conn := ts.ActiveOpen(tuple, 65535)
+	if _, ok := ts.SynSent[tuple]; !ok {
+		t.Fatal("expected connection in SynSent")
+	}
+	if ts.ConnectionCount() != 1 {
+		t.Fatalf("expected 1 connection, got %d", ts.ConnectionCount())
+	}
+
+	// AppClose should remove it from SynSent
+	ts.AppClose(conn.Tuple)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.SynSent[tuple]; ok {
+		t.Fatal("AppClose did not remove connection from SynSent")
+	}
+	if ts.ConnectionCount() != 0 {
+		t.Fatalf("expected 0 connections after AppClose on SynSent, got %d", ts.ConnectionCount())
+	}
+	if ts.HasConn(tuple) {
+		t.Fatal("HasConn should return false after AppClose removes SynSent connection")
+	}
+}
+
+func TestAppCloseSynRcvd(t *testing.T) {
+	// Regression: AppClose on SynRcvd was silently ignored.
+	cfg := DefaultConfig()
+	cfg.ListenPort = 8080
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+	ts.Listen(func(c *Conn) {}) // need listener for SYN to create connections
+
+	gwIP := net.ParseIP("192.168.65.1")
+	vmIP := net.ParseIP("192.168.65.2")
+	tuple := NewTuple(gwIP, vmIP, 8080, 12345)
+
+	// Inject SYN to create SynRcvd connection
+	synSeg := fakeSegment(vmIP, gwIP, 12345, 8080, 1000, 0, FlagSYN, nil)
+	ts.InjectSegment(synSeg)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.SynRcvd[tuple]; !ok {
+		t.Fatal("expected connection in SynRcvd")
+	}
+
+	// AppClose should remove it from SynRcvd
+	ts.AppClose(tuple)
+	ts.Deliberate(time.Now())
+
+	if _, ok := ts.SynRcvd[tuple]; ok {
+		t.Fatal("AppClose did not remove connection from SynRcvd")
+	}
+	if ts.ConnectionCount() != 0 {
+		t.Fatalf("expected 0 connections after AppClose on SynRcvd, got %d", ts.ConnectionCount())
+	}
+}
+
 func doHandshake(t *testing.T, ts *TCPState, vmIP, gwIP net.IP, srcPort, dstPort uint16) {
 	t.Helper()
 	synSeg := fakeSegment(vmIP, gwIP, srcPort, dstPort, 1000, 0, FlagSYN, nil)

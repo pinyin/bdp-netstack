@@ -225,11 +225,22 @@ func NewConn(tuple Tuple, irs uint32, iss uint32, window uint16, bufSize int) *C
 func (c *Conn) RecvAvail() int { return c.recvSize }
 
 // RecvWritable returns how many bytes can still be written to RecvBuf.
-// With window scaling (RcvShift > 0), the value is right-shifted before being
-// placed in the uint16 WindowSize field. The cap is applied post-shift in
-// scaledWindow().
 func (c *Conn) RecvWritable() int {
 	return len(c.RecvBuf) - c.recvSize
+}
+
+// scaledWindow returns the TCP header WindowSize, accounting for window scaling.
+// For SYN/SYN-ACK: returns the unscaled window (cap 65535), used with Window Scale option.
+// For non-SYN segments: returns the window right-shifted by RcvShift (RFC 1323).
+func (c *Conn) scaledWindow(syn bool) uint16 {
+	raw := c.RecvWritable()
+	if c.RcvShift > 0 && !syn {
+		raw = raw >> c.RcvShift
+	}
+	if raw > 65535 {
+		raw = 65535
+	}
+	return uint16(raw)
 }
 
 // WriteRecvBuf writes data into the receive buffer.

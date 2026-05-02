@@ -118,6 +118,14 @@ func (ts *TCPState) processAppRequests() {
 			// Passive close (peer FIN first, then app closes): CloseWait → LastAck
 			delete(ts.CloseWait, tuple)
 			ts.LastAck[tuple] = conn
+		} else if conn := ts.findConnInState(tuple, ts.SynSent); conn != nil {
+			// Host closed before handshake completed (e.g., ARP miss caused
+			// SYN to be dropped and host gave up). Remove immediately since
+			// no TCP connection was established to the peer.
+			delete(ts.SynSent, tuple)
+		} else if conn := ts.findConnInState(tuple, ts.SynRcvd); conn != nil {
+			// External host closed before handshake completed. Clean up.
+			delete(ts.SynRcvd, tuple)
 		}
 	}
 	ts.appWrites = make(map[Tuple][]byte)
@@ -181,12 +189,13 @@ func (ts *TCPState) advanceSynSent() {
 }
 
 func (ts *TCPState) sendSYN(conn *Conn) {
-	rawSeg := BuildSegment(conn.Tuple, conn.ISS, 0, FlagSYN, uint16(conn.RecvWritable()), nil)
+	win := conn.scaledWindow(true)
+	rawSeg := BuildSegmentWithWScale(conn.Tuple, conn.ISS, 0, FlagSYN, win, conn.RcvShift, nil)
 	seg := &TCPSegment{
 		Header: &TCPHeader{
 			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: 0,
-			Flags: FlagSYN, WindowSize: uint16(conn.RecvWritable()),
+			Flags: FlagSYN, WindowSize: win,
 		},
 		Tuple: conn.Tuple,
 		Raw:   rawSeg,
@@ -253,13 +262,14 @@ func (ts *TCPState) advanceSynRcvd() {
 }
 
 func (ts *TCPState) sendSYNACK(conn *Conn) {
-	rawSeg := BuildSegment(conn.Tuple, conn.ISS, conn.RCV_NXT,
-		FlagSYN|FlagACK, uint16(conn.RecvWritable()), nil)
+	win := conn.scaledWindow(true)
+	rawSeg := BuildSegmentWithWScale(conn.Tuple, conn.ISS, conn.RCV_NXT,
+		FlagSYN|FlagACK, win, conn.RcvShift, nil)
 	seg := &TCPSegment{
 		Header: &TCPHeader{
 			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: conn.RCV_NXT,
-			Flags: FlagSYN | FlagACK, WindowSize: uint16(conn.RecvWritable()),
+			Flags: FlagSYN | FlagACK, WindowSize: win,
 		},
 		Tuple: conn.Tuple,
 		Raw:   rawSeg,
@@ -598,11 +608,12 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 		}
 
 		flags := uint8(FlagACK | FlagPSH)
+		win := conn.scaledWindow(false)
 		rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
-			flags, uint16(conn.RecvWritable()), data)
+			flags, win, data)
 
 		seg := &TCPSegment{
-			Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: flags, WindowSize: uint16(conn.RecvWritable())},
+			Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: flags, WindowSize: win},
 			Tuple:   conn.Tuple,
 			Payload: data,
 			Raw:     rawSeg,
@@ -628,7 +639,7 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 
 	if sentData {
 		conn.LastAckSent = conn.RCV_NXT
-		conn.LastAckWin = uint16(conn.RecvWritable())
+		conn.LastAckWin = conn.scaledWindow(false)
 		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
 		ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 		debug.Global.TCPInFlight.Store(int64(conn.SND_NXT - conn.SND_UNA))
@@ -642,15 +653,16 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 }
 
 func (ts *TCPState) sendACK(conn *Conn) {
+	win := conn.scaledWindow(false)
 	rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
-		FlagACK, uint16(conn.RecvWritable()), nil)
+		FlagACK, win, nil)
 
 	conn.LastAckSent = conn.RCV_NXT
 	conn.LastAckTime = ts.tick
-	conn.LastAckWin = uint16(conn.RecvWritable())
+	conn.LastAckWin = conn.scaledWindow(false)
 
 	seg := &TCPSegment{
-		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagACK, WindowSize: uint16(conn.RecvWritable())},
+		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagACK, WindowSize: win},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
 	}
@@ -663,11 +675,12 @@ func (ts *TCPState) sendACK(conn *Conn) {
 }
 
 func (ts *TCPState) sendFIN(conn *Conn) {
+	win := conn.scaledWindow(false)
 	rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
-		FlagFIN|FlagACK, uint16(conn.RecvWritable()), nil)
+		FlagFIN|FlagACK, win, nil)
 
 	seg := &TCPSegment{
-		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagFIN | FlagACK, WindowSize: uint16(conn.RecvWritable())},
+		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagFIN | FlagACK, WindowSize: win},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
 	}

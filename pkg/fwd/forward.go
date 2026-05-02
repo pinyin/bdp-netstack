@@ -138,6 +138,13 @@ func (f *Forwarder) Poll() {
 					f.tcpState.AppClose(entry.VMConn.Tuple)
 				}
 			}
+			// Retry AppClose for connections where the first attempt was
+			// silently ignored (e.g., connection was in SynSent at the
+			// time and the handshake completed later). AppClose is
+			// idempotent: once Established/CloseWait, the close proceeds.
+			if !entry.deferredClose && !entry.VMClosed && entry.VMConn != nil && f.tcpState != nil {
+				f.tcpState.AppClose(entry.VMConn.Tuple)
+			}
 			continue
 		}
 		f.readHost(entry)
@@ -161,8 +168,15 @@ func (f *Forwarder) Cleanup() {
 		// Derive VMClosed from the TCP connection state:
 		// - FinReceived means the VM has sent FIN to us
 		// - If VMConn is nil, the connection was never fully established
+		// - If connection was removed from all TCP states (e.g., AppClose
+		//   removed it from SynSent/SynRcvd), treat as VMClosed.
 		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.FinReceived {
 			entry.VMClosed = true
+		}
+		if !entry.VMClosed && entry.VMConn != nil && entry.HostClosed && f.tcpState != nil {
+			if !f.tcpState.HasConn(entry.VMConn.Tuple) {
+				entry.VMClosed = true
+			}
 		}
 		if entry.HostClosed && entry.VMClosed {
 			if entry.HostConn != nil {
@@ -244,6 +258,7 @@ func (f *Forwarder) readHost(entry *Entry) {
 		return
 	}
 	if n == 0 {
+		log.Printf("Forwarder: host EOF on %s (fd=%d)", entry.VMAddr, entry.hostFD)
 		entry.HostClosed = true
 		f.maybeClose(entry)
 		return

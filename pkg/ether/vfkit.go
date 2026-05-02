@@ -65,6 +65,12 @@ func ListenVFKit(socketPath string) (*VFKitConn, error) {
 	var controlErr error
 	rawConn.Control(func(f uintptr) {
 		fd = int(f)
+		// Increase send buffer to prevent ENOBUFS when bursting TCP
+		// segments (46 MSS × 1514 bytes ≈ 70KB per tick). 256KB gives
+		// enough headroom for a full 64KB TCP window plus framing.
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 256*1024); err != nil {
+			log.Printf("VFKit: setsockopt SO_SNDBUF: %v", err)
+		}
 		// Set non-blocking before connect
 		syscall.SetNonblock(fd, true)
 		sa := unixAddrToSockaddr(remoteAddr)

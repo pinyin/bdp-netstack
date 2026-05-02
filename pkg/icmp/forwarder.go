@@ -101,6 +101,11 @@ func (f *Forwarder) Forward(srcIP, dstIP net.IP, id, seq uint16, payload []byte)
 
 // Poll reads available ICMP replies (non-blocking). Called during deliberation.
 func (f *Forwarder) Poll() {
+	// Reset read deadline for this round. The deadline is an absolute time;
+	// without this reset, a past deadline causes every ReadFrom to return
+	// immediately with a timeout, making the forwarder non-functional.
+	f.rawConn.SetReadDeadline(time.Now().Add(time.Millisecond))
+
 	buf := make([]byte, 1500)
 	for {
 		n, _, peer, err := f.rawConn.ReadFrom(buf)

@@ -106,17 +106,11 @@ func TestDataTransfer(t *testing.T) {
 		t.Fatalf("expected 'hello world', got '%s'", string(buf[:n]))
 	}
 
-	// Delayed ACK defers one round — data was just received, so ACK waits
+	// Immediate ACK: ACK is sent in the same round as data receipt.
+	// With 1ms BPT, the peer naturally gets one ACK per tick covering all
+	// segments in the batch — that's already perfect batching without
+	// extra round-trip delays that would starve the peer's cwnd.
 	outputs := ts.ConsumeOutputs()
-	for _, out := range outputs {
-		if out.Header.HasFlag(FlagACK) && out.Header.AckNum == 1001+uint32(len(payload)) {
-			t.Fatal("ACK should be delayed by one round after data receipt")
-		}
-	}
-
-	// Next deliberation: DataRcvdThisRound cleared, ACK fires
-	ts.Deliberate(time.Now())
-	outputs = ts.ConsumeOutputs()
 	hasAck := false
 	for _, out := range outputs {
 		if out.Header.HasFlag(FlagACK) && out.Header.AckNum == 1001+uint32(len(payload)) {
@@ -124,7 +118,7 @@ func TestDataTransfer(t *testing.T) {
 		}
 	}
 	if !hasAck {
-		t.Fatal("expected ACK for received data")
+		t.Fatal("expected immediate ACK for received data")
 	}
 }
 
@@ -324,6 +318,87 @@ func TestIdleTimeout(t *testing.T) {
 
 	if ts.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections after idle timeout, got %d", ts.ConnectionCount())
+	}
+}
+
+func TestPreProcessACKsDoesNotCorruptSendBuf(t *testing.T) {
+	// Regression test: PreProcessACKs should NOT call AckSendBuf for SynSent
+	// connections, because the ACK covers the SYN byte (control flag), not a
+	// data byte in the SendBuf. If AckSendBuf is called with the SYN-ACK's
+	// AckNum, sendHead advances by 1 and the first data byte is lost.
+	//
+	// This bug caused SSH to fail: "SSH-2.0-OpenSSH_10.2\r\n" (22 bytes)
+	// was truncated to "SH-2.0-OpenSSH_10.2\r\n" (21 bytes), which the
+	// VM SSH server rejected as "Invalid SSH identification string."
+	cfg := DefaultConfig()
+	cfg.GatewayIP = net.ParseIP("192.168.65.1")
+	ts := NewTCPState(cfg)
+
+	gwIP := net.ParseIP("192.168.65.1")
+	vmIP := net.ParseIP("192.168.65.2")
+
+	// Active open: forwarder creates SynSent connection
+	tuple := NewTuple(gwIP, vmIP, 32769, 22)
+	conn := ts.ActiveOpen(tuple, 65535)
+
+	// Deliberate to send SYN
+	ts.Deliberate(time.Now())
+	ts.ConsumeOutputs()
+
+	// Write 22 bytes to SendBuf — simulates forwarder reading SSH ident
+	testData := []byte("SSH-2.0-OpenSSH_10.2\r\n")
+	if len(testData) != 22 {
+		t.Fatalf("test data must be 22 bytes, got %d", len(testData))
+	}
+	n := conn.WriteSendBuf(testData)
+	if n != 22 {
+		t.Fatalf("WriteSendBuf returned %d, expected 22", n)
+	}
+	if conn.SendAvail() != 22 {
+		t.Fatalf("SendAvail = %d, expected 22", conn.SendAvail())
+	}
+	sendHeadBefore := conn.sendHead
+
+	// Inject SYN-ACK from VM
+	synAckSeg := fakeSegment(vmIP, gwIP, 22, 32769, 5000, conn.ISS+1, FlagSYN|FlagACK, nil)
+	ts.InjectSegment(synAckSeg)
+
+	// PreProcessACKs should NOT touch SynSent connections
+	ts.PreProcessACKs()
+
+	// SendBuf must be unchanged: sendHead still at 0, sendSize still 22
+	if conn.sendHead != sendHeadBefore {
+		t.Fatalf("PreProcessACKs moved sendHead from %d to %d — SYN byte was incorrectly consumed from SendBuf",
+			sendHeadBefore, conn.sendHead)
+	}
+	if conn.SendAvail() != 22 {
+		t.Fatalf("PreProcessACKs corrupted SendBuf: SendAvail = %d, expected 22", conn.SendAvail())
+	}
+
+	// Deliberate: advanceSynSent → Established, then advanceEstablished → send data
+	ts.Deliberate(time.Now())
+
+	// Verify connection moved to Established
+	if _, ok := ts.Established[tuple]; !ok {
+		t.Fatal("expected connection in Established after SYN-ACK")
+	}
+
+	// Verify the 22-byte data was sent correctly
+	outputs := ts.ConsumeOutputs()
+	var dataLen int
+	for _, out := range outputs {
+		if len(out.Payload) > 0 {
+			dataLen += len(out.Payload)
+			if len(out.Payload) != 22 {
+				t.Errorf("data payload length = %d, expected 22", len(out.Payload))
+			}
+			if string(out.Payload) != string(testData) {
+				t.Errorf("data payload = %q, expected %q", string(out.Payload), string(testData))
+			}
+		}
+	}
+	if dataLen != 22 {
+		t.Errorf("total data sent = %d bytes, expected 22", dataLen)
 	}
 }
 

@@ -1,10 +1,17 @@
 package tcp
 
 import (
+	"log"
 	"math/rand"
 	"net"
 	"time"
 )
+
+// SegmentWriteFunc is called to externalize a TCP segment (encapsulate in
+// IP/Ethernet and write to the socket). Returns an error if the write fails.
+// When set, segments are written immediately during deliberation so that
+// SND_NXT is only advanced after a successful write.
+type SegmentWriteFunc func(seg *TCPSegment) error
 
 // ============================================================================
 // TCPState: BDP state-indexed TCP engine.
@@ -19,14 +26,16 @@ type Config struct {
 	BufferSize  int           // per-connection buffer size
 	MTU         int           // max TCP payload per segment
 	IdleTimeout time.Duration // idle connection timeout (0 = no timeout)
+	MaxSegsPerTick int        // max data segments per tick (0 = default 64)
 }
 
 func DefaultConfig() Config {
 	return Config{
-		BPT:        1 * time.Millisecond,
-		BufferSize: 64 * 1024,
-		MTU:        1400,         // 1500 - IP header - TCP header
-		IdleTimeout: 30 * time.Minute,
+		BPT:            1 * time.Millisecond,
+		BufferSize:     64 * 1024,
+		MTU:            1400,         // 1500 - IP header - TCP header
+		IdleTimeout:    30 * time.Minute,
+		MaxSegsPerTick: 64,
 	}
 }
 
@@ -67,6 +76,19 @@ type TCPState struct {
 
 	// --- ISN generator ---
 	rng *rand.Rand
+
+	// --- Segment write callback (set by stack layer) ---
+	// When set, segments are written immediately during deliberation.
+	// SND_NXT is only advanced after a successful write, preventing
+	// data loss when the socket buffer is full (ENOBUFS).
+	writeFunc SegmentWriteFunc
+}
+
+// SetWriteFunc sets the segment write callback. When set, TCP segments are
+// written to the socket inline during deliberation instead of being queued
+// in ts.outputs for later externalization.
+func (ts *TCPState) SetWriteFunc(f SegmentWriteFunc) {
+	ts.writeFunc = f
 }
 
 func NewTCPState(cfg Config) *TCPState {
@@ -105,6 +127,45 @@ func (ts *TCPState) SetGatewayIP(ip net.IP) {
 // This is called from the IP layer after parsing.
 func (ts *TCPState) InjectSegment(seg *TCPSegment) {
 	ts.pending = append(ts.pending, seg)
+}
+
+// PreProcessACKs eagerly processes ACK information from all pending segments.
+// This updates SND_UNA before the main deliberation so that I/O phases
+// (NAT readHost, Forwarder readHost) see accurate SendSpace values. Without
+// this, readHost runs before TCP deliberation processes VM ACKs, causing
+// SendSpace to be stale — the host reads less data than it could.
+//
+// Safe because ACK processing is idempotent: the second pass in
+// advanceEstablished is a no-op when AckNum == SND_UNA.
+func (ts *TCPState) PreProcessACKs() {
+	for _, seg := range ts.pending {
+		tuple := seg.Tuple.Reverse()
+
+		// Skip handshake states: the ACK covers SYN bytes (control flags),
+		// not data bytes in the SendBuf. Calling AckSendBuf here would
+		// incorrectly remove a byte from the SendBuf for the SYN flag's
+		// sequence number, shifting sendHead and truncating the first
+		// data byte (e.g. "SSH-2.0..." → "SH-2.0...").
+		if _, ok := ts.SynSent[tuple]; ok {
+			continue
+		}
+		if _, ok := ts.SynRcvd[tuple]; ok {
+			continue
+		}
+
+		if conn := ts.findConn(tuple); conn != nil {
+			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
+				ackDelta := seg.Header.AckNum - conn.SND_UNA
+				conn.AckSendBuf(seg.Header.AckNum) // updates SND_UNA by min(ackDelta, sendSize)
+				conn.SND_WND = uint32(seg.Header.WindowSize)
+				if ackDelta > 1000 {
+					log.Printf("PRE-ACK: %s ack=%d→%d (+%d) win=%d sendSize=%d",
+						tuple, seg.Header.AckNum-ackDelta, seg.Header.AckNum,
+						ackDelta, seg.Header.WindowSize, conn.sendSize)
+				}
+			}
+		}
+	}
 }
 
 // AppWrite queues data from the application to be sent on a connection.

@@ -182,12 +182,10 @@ type Conn struct {
 	RetransmitAt  int64 // absolute tick when retransmit fires
 	TimeWaitUntil int64 // absolute tick when TIME_WAIT expires
 
-	// Delayed ACK
-	DataRcvdThisRound bool // new data arrived this round — defer ACK by one round
-
 	// Last ACK sent (to avoid duplicate ACKs)
 	LastAckSent uint32
 	LastAckTime int64
+	LastAckWin  uint16 // window advertised in last ACK, for window-update detection
 
 	// Idle tracking
 	LastActivityTick int64 // tick of last data or ACK received
@@ -215,6 +213,7 @@ func NewConn(tuple Tuple, irs uint32, iss uint32, window uint16, bufSize int) *C
 		Window:     window,
 		SendBuf:    make([]byte, bufSize),
 		RecvBuf:    make([]byte, bufSize),
+		LastAckWin: uint16(min(bufSize, 65535)),
 	}
 }
 

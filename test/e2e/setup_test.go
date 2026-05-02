@@ -20,7 +20,7 @@ type E2EEnv struct {
 	Cancel     context.CancelFunc
 	PrivateKey string
 	StackCmd   *exec.Cmd
-	VfkitCmd   *exec.Cmd
+	VMCmd      *exec.Cmd
 	TmpDir     string
 	t          *testing.T
 }
@@ -142,41 +142,46 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 	}
 	logf("socket ready")
 
-	// Start vfkit
-	vfkitPath, err := exec.LookPath("vfkit")
-	if err != nil {
+	// Start vz-debug (custom VZ-based VM launcher with frame-level debug logging)
+	vzDebugPath := filepath.Join(projRoot, "..", "..", "..", "..", "developer", "POC", "vz-debug", ".build", "debug", "vz-debug")
+	if _, err := os.Stat(vzDebugPath); err != nil {
+		// Try absolute path
+		vzDebugPath = filepath.Join(os.Getenv("HOME"), "developer", "POC", "vz-debug", ".build", "debug", "vz-debug")
+	}
+	if _, err := os.Stat(vzDebugPath); err != nil {
 		cancel()
 		os.RemoveAll(tmpDir)
-		t.Skipf("vfkit not found: %v", err)
+		t.Fatalf("vz-debug not found at %s: build it with: cd ~/developer/POC/vz-debug && swift build", vzDebugPath)
 	}
 
 	consoleLogPath := filepath.Join(os.TempDir(), "bdp-e2e-console.log")
-	vfkitArgs := []string{
+	vmArgs := []string{
 		"--cpus", "2",
 		"--memory", "2048",
-		"--bootloader", "efi,variable-store=" + efiStorePath + ",create",
-		"--device", "virtio-blk,path=" + rawImage,
-		"--device", "virtio-net,unixSocketPath=" + sockPath + ",mac=" + vmMAC,
-		"--device", "virtio-serial,logFilePath=" + consoleLogPath,
+		"--efi-store", efiStorePath,
+		"--disk", rawImage,
+		"--socket", sockPath,
+		"--mac", vmMAC,
+		"--console-log", consoleLogPath,
 	}
-	vfkitCmd := exec.CommandContext(ctx, vfkitPath, vfkitArgs...)
-	vfkitCmd.Stderr = vfkitLog
-	vfkitCmd.Stdout = vfkitLog
-	logf("starting vfkit: %s %v", vfkitPath, vfkitArgs)
-	if err := vfkitCmd.Start(); err != nil {
-		logf("FAIL: start vfkit: %v", err)
+	vmCmd := exec.CommandContext(ctx, vzDebugPath, vmArgs...)
+	vmCmd.Stderr = vfkitLog
+	vmCmd.Stdout = vfkitLog
+	logf("starting vz-debug: %s %v", vzDebugPath, vmArgs)
+	if err := vmCmd.Start(); err != nil {
+		logf("FAIL: start vz-debug: %v", err)
 		cancel()
 		os.RemoveAll(tmpDir)
-		t.Fatalf("start vfkit: %v", err)
+		t.Fatalf("start vz-debug: %v", err)
 	}
-	logf("vfkit started (pid=%d)", vfkitCmd.Process.Pid)
+	logf("vz-debug started (pid=%d)", vmCmd.Process.Pid)
 
 	env := &E2EEnv{
 		Ctx:        ctx,
 		Cancel:     cancel,
 		PrivateKey: privateKeyFile,
 		StackCmd:   stackCmd,
-		VfkitCmd:   vfkitCmd,
+		VMCmd:      vmCmd,
 		TmpDir:     tmpDir,
 		t:          t,
 	}
@@ -231,8 +236,8 @@ func (e *E2EEnv) Cleanup() {
 	if e.StackCmd != nil && e.StackCmd.Process != nil {
 		e.StackCmd.Process.Kill()
 	}
-	if e.VfkitCmd != nil && e.VfkitCmd.Process != nil {
-		e.VfkitCmd.Process.Kill()
+	if e.VMCmd != nil && e.VMCmd.Process != nil {
+		e.VMCmd.Process.Kill()
 	}
 	e.Cancel()
 	e.t.Logf("Logs preserved at: /tmp/bdp-e2e-test.log")

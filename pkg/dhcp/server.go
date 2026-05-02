@@ -60,13 +60,17 @@ func DefaultServerConfig() ServerConfig {
 	}
 }
 
+// OnLease is called when a DHCP ACK assigns an IP to a client MAC.
+// This allows the stack to learn the VM's ARP entry (IP → MAC).
+var OnLease func(clientIP net.IP, clientMAC net.HardwareAddr)
+
 // Server is a BDP-style DHCP server. It has no goroutines; all processing
 // happens during deliberation by the UDP layer calling the handler.
 type Server struct {
-	cfg     ServerConfig
-	leases  map[[6]byte]*Lease // keyed by client MAC
-	allocated map[[4]byte]bool  // keyed by IP
-	nextIP  net.IP
+	cfg       ServerConfig
+	leases    map[[6]byte]*Lease // keyed by client MAC
+	allocated map[[4]byte]bool   // keyed by IP
+	nextIP    net.IP
 }
 
 // Lease represents an IP lease to a client.
@@ -183,6 +187,10 @@ func (s *Server) buildAck(dg *udp.UDPDatagram, clientMAC [6]byte) *udp.UDPDatagr
 		typeName = "ACK"
 	}
 	log.Printf("DHCP: %s %s to %s (dst=%s)", typeName, reqIP, clientMAC, dstIP)
+
+	if msgType == MsgAck && OnLease != nil {
+		OnLease(reqIP, net.HardwareAddr(clientMAC[:]))
+	}
 
 	return &udp.UDPDatagram{
 		SrcIP:   s.cfg.GatewayIP,

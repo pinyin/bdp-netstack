@@ -34,6 +34,7 @@ type FlowStats struct {
 	OutSegs    atomic.Int64
 	OutBytes   atomic.Int64
 	OutARPMiss atomic.Int64
+	OutBufFull atomic.Int64 // ENOBUFS on vfkit socket write
 
 	lastPrint time.Time
 }
@@ -54,7 +55,7 @@ func (s *FlowStats) Print() {
 	log.Printf("DEBUG STATS (1s window): "+
 		"read={calls:%d bytes:%d eagain:%d full:%d bufb:%d} "+
 		"tcp={segs:%d bytes:%d ack:%d nosend:%d inflight:%d cansnd:%d} "+
-		"out={segs:%d bytes:%d arpmiss:%d}",
+		"out={segs:%d bytes:%d arpmiss:%d buffull:%d}",
 		s.FwdReadCalls.Swap(0),
 		s.FwdReadBytes.Swap(0),
 		s.FwdReadEAGAIN.Swap(0),
@@ -69,5 +70,6 @@ func (s *FlowStats) Print() {
 		s.OutSegs.Swap(0),
 		s.OutBytes.Swap(0),
 		s.OutARPMiss.Swap(0),
+		s.OutBufFull.Swap(0),
 	)
 }

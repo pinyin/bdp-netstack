@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/debug"
@@ -112,6 +113,14 @@ func New(cfg Config, tcpState *tcp.TCPState) *Stack {
 		if err != nil {
 			log.Printf("port forwarding setup failed: %v", err)
 		}
+		// DHCP will learn the VM's MAC→IP mapping when ACK is sent,
+		// so the forwarder's first TCP SYN can resolve the VM's MAC.
+		dhcp.OnLease = func(clientIP net.IP, clientMAC net.HardwareAddr) {
+			if s.cfg.Debug {
+				log.Printf("ARP learn from DHCP: %s → %s", clientIP, clientMAC)
+			}
+			s.arp.Set(clientIP, clientMAC)
+		}
 	}
 
 	// Set up ICMP forwarder (non-privileged, works in sandbox)
@@ -123,6 +132,13 @@ func New(cfg Config, tcpState *tcp.TCPState) *Stack {
 
 	// ARP: statically map gateway IP to our MAC
 	s.arp.Set(cfg.GatewayIP, cfg.GatewayMAC)
+
+	// Set TCP write callback so segments are written to the socket inline
+	// during deliberation. This ensures SND_NXT is only advanced after a
+	// successful write, preventing data loss when socket buffer is full.
+	tcpState.SetWriteFunc(func(seg *tcp.TCPSegment) error {
+		return s.sendSegment(seg)
+	})
 
 	return s
 }
@@ -179,6 +195,12 @@ func (s *Stack) deliberate(now time.Time) {
 		}
 	}
 
+	// Phase 1.5: Pre-process ACKs — eagerly update SND_UNA from VM ACKs
+	// that arrived in Phase 1. This ensures Phase 2 (Forwarder Poll) and
+	// Phase 3 (NAT Poll) see accurate SendSpace before reading from host
+	// sockets. Safe because ACK processing is idempotent.
+	s.tcpState.PreProcessACKs()
+
 	// Phase 2: Forwarder — accept new connections + poll host reads
 	if s.fwd != nil {
 		s.fwd.PollAccept(s.tcpState)
@@ -210,9 +232,17 @@ func (s *Stack) deliberate(now time.Time) {
 	// Phase 9: UDP NAT — write queued VM datagrams to host sockets
 	s.udpNAT.FlushEgress()
 
-	// Phase 10: Write outgoing TCP segments
+	// Phase 10: Write any remaining TCP segments (only used when writeFunc
+	// is nil, e.g. in tests). With writeFunc set, segments are written
+	// inline during Phase 5 and ts.outputs is always empty.
 	for _, seg := range s.tcpState.ConsumeOutputs() {
-		s.sendSegment(seg)
+		if err := s.sendSegment(seg); err != nil {
+			// ENOBUFS already tracked in sendSegment
+			if err == syscall.ENOBUFS {
+				break // socket buffer full; defer remaining to next tick
+			}
+			log.Printf("write frame: %v", err)
+		}
 	}
 
 	// Phase 11: Write outgoing UDP datagrams
@@ -269,7 +299,7 @@ func (s *Stack) sendICMPReply(reply icmp.Reply) {
 		Payload:  icmpData,
 	}
 
-	s.writeIPv4Packet(dstMAC, ipPkt)
+	_ = s.writeIPv4Packet(dstMAC, ipPkt)
 }
 
 // processFrame processes one incoming Ethernet frame.
@@ -324,6 +354,13 @@ func (s *Stack) processIPv4(frame *ether.Frame) {
 		}
 		return
 	}
+
+	// Learn source IP→MAC from every IPv4 frame, matching gvproxy's
+	// Switch CAM behavior. This ensures the forwarder can send unicast
+	// TCP SYNs to the VM immediately after the VM sends its first IP
+	// packet (DNS query, ARP request, etc.), without waiting for a
+	// dedicated ARP exchange.
+	s.arp.Set(pkt.SrcIP, frame.SrcMAC)
 
 	// TCP to external IPs → NAT
 	if pkt.Protocol == ipv4.ProtocolTCP && !pkt.IsForUs(s.cfg.GatewayIP) {
@@ -384,7 +421,7 @@ func (s *Stack) processICMP(frame *ether.Frame, pkt *ipv4.Packet) {
 	}
 
 	log.Printf("ICMP: Echo Reply from %s to %s via %s", ipReply.SrcIP, ipReply.DstIP, frame.SrcMAC)
-	s.writeIPv4Packet(frame.SrcMAC, ipReply)
+	_ = s.writeIPv4Packet(frame.SrcMAC, ipReply)
 }
 
 // processICMPForward forwards ICMP Echo Requests to external hosts.
@@ -438,6 +475,26 @@ func (s *Stack) processTCP(frame *ether.Frame, pkt *ipv4.Packet) {
 		return
 	}
 
+	// Log incoming data and control segments
+	if len(seg.Payload) > 0 {
+		preview := len(seg.Payload)
+		if preview > 32 {
+			preview = 32
+		}
+		log.Printf("TCP RECV: %s:%d→%s:%d seq=%d ack=%d flags=%02x len=%d payload=%x",
+			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
+			seg.Tuple.DstIPNet(), seg.Tuple.DstPort,
+			seg.Header.SeqNum, seg.Header.AckNum,
+			seg.Header.Flags, len(seg.Payload),
+			seg.Payload[:preview])
+	} else if seg.Header.IsSYN() || seg.Header.IsFIN() || seg.Header.IsRST() {
+		log.Printf("TCP RECV: %s:%d→%s:%d seq=%d ack=%d flags=%02x win=%d (control)",
+			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
+			seg.Tuple.DstIPNet(), seg.Tuple.DstPort,
+			seg.Header.SeqNum, seg.Header.AckNum,
+			seg.Header.Flags, seg.Header.WindowSize)
+	}
+
 	s.tcpState.InjectSegment(seg)
 }
 
@@ -480,21 +537,14 @@ func (s *Stack) processNAT(frame *ether.Frame, pkt *ipv4.Packet) {
 }
 
 // sendSegment encapsulates a TCP segment in IP/Ethernet and writes to vfkit.
-func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
+// Returns the write error, or nil on success.
+func (s *Stack) sendSegment(seg *tcp.TCPSegment) error {
 	dstIP := seg.Tuple.DstIPNet()
 	dstMAC, ok := s.arp.Lookup(dstIP)
 	if !ok {
 		debug.Global.OutARPMiss.Add(1)
 		log.Printf("no ARP entry for %s, dropping TCP segment (flags=%d, sport=%d, dport=%d)", dstIP, seg.Header.Flags, seg.Tuple.SrcPort, seg.Tuple.DstPort)
-		return
-	}
-
-	if s.cfg.Debug {
-		log.Printf("TCP send: %s:%d → %s:%d (flags=%d, seq=%d, ack=%d, len=%d, dstMAC=%s)",
-			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
-			dstIP, seg.Tuple.DstPort,
-			seg.Header.Flags, seg.Header.SeqNum, seg.Header.AckNum,
-			len(seg.Payload), dstMAC)
+		return nil
 	}
 
 	tcpBytes := seg.Raw
@@ -506,6 +556,35 @@ func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
 	cs := tcp.TCPChecksum(seg.Tuple.SrcIPNet(), seg.Tuple.DstIPNet(), tcpBytes)
 	tcpBytes[16] = byte(cs >> 8)
 	tcpBytes[17] = byte(cs)
+
+	// Verify checksum: one's complement sum of entire segment + pseudo-header
+	// should be 0xFFFF (0x0000 after one's complement)
+	verify := tcp.TCPChecksum(seg.Tuple.SrcIPNet(), seg.Tuple.DstIPNet(), tcpBytes)
+	if verify != 0 {
+		log.Printf("TCP CHECKSUM ERROR: computed=%04x verify=%04x tuple=%s seq=%d ack=%d len=%d",
+			cs, verify, seg.Tuple, seg.Header.SeqNum, seg.Header.AckNum, len(seg.Payload))
+	}
+
+	// Debug: log data segments with payload > 50 bytes to trace SSH/KEXINIT flow
+	if len(seg.Payload) > 50 {
+		preview := len(seg.Payload)
+		if preview > 64 {
+			preview = 64
+		}
+		log.Printf("TCP DATA: %s:%d→%s:%d seq=%d ack=%d flags=%02x win=%d len=%d cs=%04x payload=%x",
+			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
+			dstIP, seg.Tuple.DstPort,
+			seg.Header.SeqNum, seg.Header.AckNum,
+			seg.Header.Flags, seg.Header.WindowSize,
+			len(seg.Payload), cs,
+			seg.Payload[:preview])
+	} else if s.cfg.Debug {
+		log.Printf("TCP send: %s:%d → %s:%d (flags=%d, seq=%d, ack=%d, len=%d, dstMAC=%s)",
+			seg.Tuple.SrcIPNet(), seg.Tuple.SrcPort,
+			dstIP, seg.Tuple.DstPort,
+			seg.Header.Flags, seg.Header.SeqNum, seg.Header.AckNum,
+			len(seg.Payload), dstMAC)
+	}
 
 	ipPkt := &ipv4.Packet{
 		Version:  4,
@@ -521,7 +600,11 @@ func (s *Stack) sendSegment(seg *tcp.TCPSegment) {
 
 	debug.Global.OutSegs.Add(1)
 	debug.Global.OutBytes.Add(int64(len(seg.Payload)))
-	s.writeIPv4Packet(dstMAC, ipPkt)
+	err := s.writeIPv4Packet(dstMAC, ipPkt)
+	if err == syscall.ENOBUFS {
+		debug.Global.OutBufFull.Add(1)
+	}
+	return err
 }
 
 // sendDatagram encapsulates a UDP datagram in IP/Ethernet and writes to vfkit.
@@ -549,13 +632,13 @@ func (s *Stack) sendDatagram(dg *udp.UDPDatagram) {
 		Payload:  udpBytes,
 	}
 
-	s.writeIPv4Packet(dstMAC, ipPkt)
+	_ = s.writeIPv4Packet(dstMAC, ipPkt)
 }
 
 // writeIPv4Packet serializes and writes an IP packet as an Ethernet frame.
-func (s *Stack) writeIPv4Packet(dstMAC net.HardwareAddr, pkt *ipv4.Packet) {
+func (s *Stack) writeIPv4Packet(dstMAC net.HardwareAddr, pkt *ipv4.Packet) error {
 	if s.conn == nil {
-		return
+		return nil
 	}
 	ipBytes := pkt.Serialize()
 	frame := &ether.Frame{
@@ -566,9 +649,10 @@ func (s *Stack) writeIPv4Packet(dstMAC net.HardwareAddr, pkt *ipv4.Packet) {
 	}
 
 	if err := s.conn.WriteFrame(frame); err != nil {
-		log.Printf("write frame: %v", err)
+		return err
 	}
 	s.bytesOut += uint64(len(ipBytes))
+	return nil
 }
 
 // TCPState returns the TCP state engine.

@@ -6,6 +6,7 @@ package e2e
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -124,6 +125,58 @@ func TestE2EBasic(t *testing.T) {
 			t.Logf("curl closed port correctly failed: %v", err)
 		} else {
 			t.Logf("curl closed port (unexpected): %s", out)
+		}
+	})
+
+	// TestConcurrentSSHAndNAT reproduces a cross-connection data leak
+	// where HTTP response data from NAT connections contaminates SSH
+	// forwarder connections. The existing sequential tests didn't catch
+	// this because they never exercise both paths simultaneously.
+	t.Run("ConcurrentSSHAndNAT", func(t *testing.T) {
+		// Start continuous HTTP downloads in the background to keep
+		// NAT TCP connections active while we exercise SSH forwarding.
+		// Use multiple parallel curls to ensure sustained NAT traffic.
+		//
+		// NOTE: each subshell MUST have stdin/stdout/stderr redirected
+		// away from the SSH channel (</dev/null >/dev/null 2>&1), or
+		// the SSH server will keep the session open after bash exits,
+		// causing the SSH command to block forever.
+		bashOut, bashErr := env.sshOutput("bash -c '" +
+			"for i in $(seq 1 10); do " +
+			"  (while true; do curl -s --connect-timeout 5 --max-time 10 " +
+			"    http://example.com; sleep 0.1; done) " +
+			"  </dev/null >/dev/null 2>&1 & " +
+			"done'")
+			if bashErr != nil {
+				t.Fatalf("failed to start background HTTP: %v\n%s", bashErr, bashOut)
+			}
+
+		// Give HTTP connections time to establish and start transferring
+		time.Sleep(3 * time.Second)
+
+		// Now repeatedly open NEW SSH connections. Each creates a fresh
+		// forwarder entry. If NAT HTTP data leaks into forwarder RecvBuf,
+		// these SSH connections will see corrupted data.
+		failures := 0
+		for i := 0; i < 15; i++ {
+			out, err := env.sshOutput("whoami")
+			if err != nil {
+				failures++
+				t.Logf("SSH attempt %d failed: %v | output: %q", i+1, err, out)
+			} else if got := strings.TrimSpace(out); got != "root" {
+				failures++
+				t.Logf("SSH attempt %d: wrong output %q", i+1, got)
+			}
+		}
+
+		// Kill background HTTP processes
+		env.sshOutputOrLog("pkill -f 'while true.*curl' 2>/dev/null; pkill curl 2>/dev/null; true")
+
+		if failures > 0 {
+			t.Errorf("%d/%d SSH attempts failed while NAT HTTP traffic was active "+
+				"(cross-connection data leak reproduced)", failures, 15)
+		} else {
+			t.Log("All SSH attempts succeeded — no cross-connection leak detected")
 		}
 	})
 }

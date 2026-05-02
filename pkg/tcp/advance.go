@@ -158,7 +158,16 @@ func (ts *TCPState) advanceSynSent() {
 		if acked {
 			// SYN_SENT → ESTABLISHED (forward cascade)
 			delete(ts.SynSent, tuple)
-			conn.PendingSegs = nil
+			// Preserve data segments that arrived with/after SYN-ACK
+			// for advanceEstablished to process. Only remove the SYN-ACK itself.
+			remaining := conn.PendingSegs[:0]
+			for _, seg := range conn.PendingSegs {
+				if seg.Header.IsSYN() && seg.Header.IsACK() {
+					continue // discard the SYN-ACK
+				}
+				remaining = append(remaining, seg)
+			}
+			conn.PendingSegs = remaining
 			ts.Established[tuple] = conn
 			// Send ACK for the SYN-ACK
 			ts.sendACK(conn)
@@ -174,11 +183,8 @@ func (ts *TCPState) advanceSynSent() {
 }
 
 func (ts *TCPState) sendSYN(conn *Conn) {
-	conn.SND_NXT = conn.ISS + 1 // SYN consumes one sequence number
-	conn.RetransmitAt = ts.tick + ts.msToTicks(200)
-
 	rawSeg := BuildSegment(conn.Tuple, conn.ISS, 0, FlagSYN, uint16(conn.RecvWritable()), nil)
-	ts.outputs = append(ts.outputs, &TCPSegment{
+	seg := &TCPSegment{
 		Header: &TCPHeader{
 			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: 0,
@@ -186,7 +192,18 @@ func (ts *TCPState) sendSYN(conn *Conn) {
 		},
 		Tuple: conn.Tuple,
 		Raw:   rawSeg,
-	})
+	}
+
+	if ts.writeFunc != nil {
+		if err := ts.writeFunc(seg); err != nil {
+			return // write failed; retry next tick with same ISS
+		}
+	} else {
+		ts.outputs = append(ts.outputs, seg)
+	}
+
+	conn.SND_NXT = conn.ISS + 1 // SYN consumes one sequence number
+	conn.RetransmitAt = ts.tick + ts.msToTicks(200)
 	ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 }
 
@@ -211,7 +228,15 @@ func (ts *TCPState) advanceSynRcvd() {
 			// SYN_RCVD → ESTABLISHED (forward cascade!)
 			// Established is "later" in traversal → will be processed in this same round
 			delete(ts.SynRcvd, tuple)
-			conn.PendingSegs = nil // consumed
+			// Preserve data segments (ACK may carry payload per RFC 793)
+			remaining := conn.PendingSegs[:0]
+			for _, seg := range conn.PendingSegs {
+				if seg.Header.IsACK() && seg.Header.AckNum == conn.ISS+1 && len(seg.Payload) == 0 {
+					continue // discard the pure ACK that completed handshake
+				}
+				remaining = append(remaining, seg)
+			}
+			conn.PendingSegs = remaining
 			ts.Established[tuple] = conn
 
 			if ts.listener != nil && ts.listener.OnAccept != nil {
@@ -230,12 +255,9 @@ func (ts *TCPState) advanceSynRcvd() {
 }
 
 func (ts *TCPState) sendSYNACK(conn *Conn) {
-	conn.SND_NXT = conn.ISS + 1 // the SYN in SYN-ACK consumes one sequence number
-		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
-
 	rawSeg := BuildSegment(conn.Tuple, conn.ISS, conn.RCV_NXT,
 		FlagSYN|FlagACK, uint16(conn.RecvWritable()), nil)
-	ts.outputs = append(ts.outputs, &TCPSegment{
+	seg := &TCPSegment{
 		Header: &TCPHeader{
 			SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort,
 			SeqNum: conn.ISS, AckNum: conn.RCV_NXT,
@@ -243,7 +265,18 @@ func (ts *TCPState) sendSYNACK(conn *Conn) {
 		},
 		Tuple: conn.Tuple,
 		Raw:   rawSeg,
-	})
+	}
+
+	if ts.writeFunc != nil {
+		if err := ts.writeFunc(seg); err != nil {
+			return // write failed; retry next tick with same ISS
+		}
+	} else {
+		ts.outputs = append(ts.outputs, seg)
+	}
+
+	conn.SND_NXT = conn.ISS + 1 // the SYN in SYN-ACK consumes one sequence number
+	conn.RetransmitAt = ts.tick + ts.msToTicks(200)
 	ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 }
 
@@ -262,7 +295,6 @@ func (ts *TCPState) advanceEstablished() {
 			// Process ACK
 			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
 				conn.AckSendBuf(seg.Header.AckNum)
-				conn.SND_UNA = seg.Header.AckNum
 				conn.SND_WND = uint32(seg.Header.WindowSize)
 			}
 
@@ -271,7 +303,6 @@ func (ts *TCPState) advanceEstablished() {
 				n := conn.WriteRecvBuf(seg.Payload)
 				if n > 0 {
 					conn.RCV_NXT += uint32(n)
-					conn.DataRcvdThisRound = true
 				}
 			}
 
@@ -308,7 +339,6 @@ func (ts *TCPState) advanceEstablished() {
 
 		// Send any pending data and ACKs
 		ts.sendDataAndAcks(conn)
-		conn.DataRcvdThisRound = false
 		conn.PendingSegs = nil
 	}
 }
@@ -325,7 +355,6 @@ func (ts *TCPState) advanceCloseWait() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
 				conn.AckSendBuf(seg.Header.AckNum)
-				conn.SND_UNA = seg.Header.AckNum
 			}
 			if len(seg.Payload) > 0 && seg.Header.SeqNum == conn.RCV_NXT {
 				n := conn.WriteRecvBuf(seg.Payload)
@@ -343,7 +372,6 @@ func (ts *TCPState) advanceCloseWait() {
 		}
 
 		ts.sendDataAndAcks(conn)
-		conn.DataRcvdThisRound = false
 		conn.PendingSegs = nil
 	}
 }
@@ -360,7 +388,6 @@ func (ts *TCPState) advanceLastAck() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() && seg.Header.AckNum > conn.SND_UNA {
 				conn.AckSendBuf(seg.Header.AckNum)
-				conn.SND_UNA = seg.Header.AckNum
 				// Check if ACK covers our FIN
 				if conn.FinSent {
 					acked = true
@@ -396,9 +423,6 @@ func (ts *TCPState) advanceFinWait1() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
-				if seg.Header.AckNum > conn.SND_UNA {
-					conn.SND_UNA = seg.Header.AckNum
-				}
 				// Our FIN was acked if the ACK covers our FIN seq = ISS+1+dataSent
 				if conn.FinSent && seg.Header.AckNum > conn.ISS+1 {
 					hasAckOfFin = true
@@ -418,7 +442,6 @@ func (ts *TCPState) advanceFinWait1() {
 				n := conn.WriteRecvBuf(seg.Payload)
 				if n > 0 {
 					conn.RCV_NXT += uint32(n)
-					conn.DataRcvdThisRound = true
 				}
 			}
 		}
@@ -468,7 +491,6 @@ func (ts *TCPState) advanceFinWait2() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
-				conn.SND_UNA = seg.Header.AckNum
 			}
 			if seg.Header.IsFIN() {
 				conn.FinReceived = true
@@ -541,9 +563,17 @@ func (ts *TCPState) reclaimIdle() {
 
 func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 	mss := ts.cfg.MTU - 20
+	maxSegs := ts.cfg.MaxSegsPerTick
+	if maxSegs <= 0 {
+		maxSegs = 12 // safe: 12 × 1400 = 16.8KB per connection per tick
+	}
 	sentData := false
+	segCount := 0
 
 	for {
+		if segCount >= maxSegs {
+			break // per-tick budget exhausted; continue next tick
+		}
 		inFlight := conn.SND_NXT - conn.SND_UNA
 		window := conn.SND_WND
 		if window == 0 {
@@ -562,24 +592,38 @@ func (ts *TCPState) sendDataAndAcks(conn *Conn) {
 			break // no more data to send
 		}
 
-		sentData = true
-		debug.Global.TCPDataSegs.Add(1)
-		debug.Global.TCPDataBytes.Add(int64(len(data)))
 		flags := uint8(FlagACK | FlagPSH)
 		rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
 			flags, uint16(conn.RecvWritable()), data)
 
-		conn.SND_NXT += uint32(len(data))
-
-		ts.outputs = append(ts.outputs, &TCPSegment{
-			Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT - uint32(len(data)), AckNum: conn.RCV_NXT, Flags: flags, WindowSize: uint16(conn.RecvWritable())},
+		seg := &TCPSegment{
+			Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: flags, WindowSize: uint16(conn.RecvWritable())},
 			Tuple:   conn.Tuple,
 			Payload: data,
 			Raw:     rawSeg,
-		})
+		}
+
+		// Write segment immediately if callback is set. Only advance
+		// SND_NXT on success so that lost segments are retransmitted
+		// with the same sequence numbers on the next tick.
+		if ts.writeFunc != nil {
+			if err := ts.writeFunc(seg); err != nil {
+				break // write failed (e.g. ENOBUFS); retry next tick
+			}
+		} else {
+			ts.outputs = append(ts.outputs, seg)
+		}
+
+		conn.SND_NXT += uint32(len(data))
+		sentData = true
+		segCount++
+		debug.Global.TCPDataSegs.Add(1)
+		debug.Global.TCPDataBytes.Add(int64(len(data)))
 	}
 
 	if sentData {
+		conn.LastAckSent = conn.RCV_NXT
+		conn.LastAckWin = uint16(conn.RecvWritable())
 		conn.RetransmitAt = ts.tick + ts.msToTicks(200)
 		ts.timerWheel.Schedule(conn.Tuple, conn.RetransmitAt)
 		debug.Global.TCPInFlight.Store(int64(conn.SND_NXT - conn.SND_UNA))
@@ -598,38 +642,57 @@ func (ts *TCPState) sendACK(conn *Conn) {
 
 	conn.LastAckSent = conn.RCV_NXT
 	conn.LastAckTime = ts.tick
+	conn.LastAckWin = uint16(conn.RecvWritable())
 
-	ts.outputs = append(ts.outputs, &TCPSegment{
+	seg := &TCPSegment{
 		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagACK, WindowSize: uint16(conn.RecvWritable())},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
-	})
+	}
+
+	if ts.writeFunc != nil {
+		ts.writeFunc(seg) // best-effort; ACKs don't advance SND_NXT
+	} else {
+		ts.outputs = append(ts.outputs, seg)
+	}
 }
 
 func (ts *TCPState) sendFIN(conn *Conn) {
 	rawSeg := BuildSegment(conn.Tuple, conn.SND_NXT, conn.RCV_NXT,
 		FlagFIN|FlagACK, uint16(conn.RecvWritable()), nil)
 
-	ts.outputs = append(ts.outputs, &TCPSegment{
+	seg := &TCPSegment{
 		Header:  &TCPHeader{SrcPort: conn.Tuple.SrcPort, DstPort: conn.Tuple.DstPort, SeqNum: conn.SND_NXT, AckNum: conn.RCV_NXT, Flags: FlagFIN | FlagACK, WindowSize: uint16(conn.RecvWritable())},
 		Tuple:   conn.Tuple,
 		Raw:     rawSeg,
-	})
+	}
+
+	if ts.writeFunc != nil {
+		if err := ts.writeFunc(seg); err != nil {
+			return // write failed; retry next tick
+		}
+	} else {
+		ts.outputs = append(ts.outputs, seg)
+	}
+
 	conn.SND_NXT++
 	conn.FinSent = true
 }
 
 func (ts *TCPState) needACK(conn *Conn) bool {
-	if conn.RCV_NXT == conn.LastAckSent {
-		return false
+	if conn.RCV_NXT != conn.LastAckSent {
+		return true
 	}
-	// Delayed ACK: defer ACK by one round when new data arrived this round,
-	// so multiple segments can be acknowledged in a single reply. This avoids
-	// the "silly window syndrome" of tiny ACK segments.
-	if conn.DataRcvdThisRound {
-		return false
+	// Window update: the last ACK advertised a window too small for the
+	// peer to send (zero, or below 1 MSS). If the window has since opened
+	// enough to receive at least one full segment, send an update so the
+	// peer unblocks. Without this, upload stalls after RecvBuf fills up
+	// because the peer never learns the buffer has been drained.
+	mss := ts.cfg.MTU - 20
+	if int(conn.LastAckWin) < mss && conn.RecvWritable() >= mss {
+		return true
 	}
-	return true
+	return false
 }
 
 func (ts *TCPState) generateISN() uint32 {

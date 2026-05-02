@@ -100,22 +100,25 @@ func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
 	return false
 }
 
-// Poll performs non-blocking I/O on all host connections.
-// Called during the deliberation phase.
-func (t *Table) Poll() {
-	// Process pending dials
+// PollDials processes pending host dials only. Called BEFORE TCP deliberation
+// so new connections have their host-side TCP socket ready.
+// This is separated from PollReads because reads MUST happen after TCP
+// deliberation (which processes VM ACKs and frees SendBuf space).
+func (t *Table) PollDials() {
 	for _, pd := range t.pendingDials {
 		t.doDial(pd)
 	}
 	t.pendingDials = nil
+}
 
-	// Non-blocking read from all host connections
+// PollReads performs non-blocking reads from all host connections.
+// Called AFTER TCP deliberation so VM ACKs have freed SendBuf space.
+func (t *Table) PollReads() {
 	for _, entry := range t.entries {
 		if entry.HostConn == nil {
 			continue
 		}
 		if entry.HostClosed {
-			// Deferred close: host EOF was seen but data remains in send buffer.
 			if entry.deferredClose && entry.VMConn != nil && entry.VMConn.SendAvail() == 0 {
 				entry.deferredClose = false
 				if t.tcpState != nil {
@@ -126,6 +129,13 @@ func (t *Table) Poll() {
 		}
 		t.readHost(entry)
 	}
+}
+
+// Deprecated: Poll is kept for backward compatibility with tests.
+// Use PollDials + PollReads instead.
+func (t *Table) Poll() {
+	t.PollDials()
+	t.PollReads()
 }
 
 // ProxyVMToHost copies data from VM receive buffers to host connections.

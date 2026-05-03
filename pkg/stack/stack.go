@@ -56,8 +56,9 @@ type Stack struct {
 	tcpState *tcp.TCPState
 
 	// UDP + services
-	udpMux  *udp.Mux
-	dhcpSrv *dhcp.Server
+	udpMux   *udp.Mux
+	dhcpSrv  *dhcp.Server
+	dnsProxy *dns.Proxy
 
 	// NAT / conntrack
 	natTable *nat.Table
@@ -102,9 +103,9 @@ func New(cfg Config, tcpState *tcp.TCPState) *Stack {
 	s.udpMux.Register(dhcp.ServerPort, s.dhcpSrv.Handler())
 
 	// Set up DNS proxy
-	dnsProxy := dns.NewProxy(cfg.GatewayIP, "")
-	log.Printf("DNS upstream: %s", dnsProxy.Upstream())
-	s.udpMux.Register(dns.DNSPort, dnsProxy.Handler())
+	s.dnsProxy = dns.NewProxy(cfg.GatewayIP, "")
+	log.Printf("DNS upstream: %s", s.dnsProxy.Upstream())
+	s.udpMux.Register(dns.DNSPort, s.dnsProxy.Handler())
 
 	// Set up port forwarding
 	if len(cfg.PortForwards) > 0 {
@@ -241,7 +242,15 @@ func (s *Stack) deliberate(now time.Time) {
 	// Phase 9: UDP NAT — write queued VM datagrams to host sockets
 	s.udpNAT.FlushEgress()
 
-	// Phase 10: Write any remaining TCP segments (only used when writeFunc
+	// Phase 10: Poll async DNS resolutions and enqueue responses as UDP output.
+	s.dnsProxy.Poll()
+
+	// Phase 11: Write DNS responses as UDP datagrams.
+	for _, dg := range s.dnsProxy.ConsumeResponses() {
+		s.sendDatagram(dg)
+	}
+
+	// Phase 12: Write any remaining TCP segments (only used when writeFunc
 	// is nil, e.g. in tests). With writeFunc set, segments are written
 	// inline during Phase 5 and ts.outputs is always empty.
 	for _, seg := range s.tcpState.ConsumeOutputs() {
@@ -254,32 +263,32 @@ func (s *Stack) deliberate(now time.Time) {
 		}
 	}
 
-	// Phase 11: Write outgoing UDP datagrams
+	// Phase 13: Write outgoing UDP datagrams
 	for _, dg := range s.udpMux.ConsumeOutputs() {
 		s.sendDatagram(dg)
 	}
 
-	// Phase 12: Write ICMP replies to VM
+	// Phase 14: Write ICMP replies to VM
 	if s.icmpFwd != nil {
 		for _, reply := range s.icmpFwd.ConsumeReplies() {
 			s.sendICMPReply(reply)
 		}
 	}
 
-	// Phase 13: UDP NAT — deliver host responses to VM
+	// Phase 15: UDP NAT — deliver host responses to VM
 	for _, dg := range s.udpNAT.DeliverToVM() {
 		s.sendDatagram(dg)
 	}
 
-	// Phase 14: Forwarder cleanup
+	// Phase 16: Forwarder cleanup
 	if s.fwd != nil {
 		s.fwd.Cleanup()
 	}
 
-	// Phase 15: NAT cleanup
+	// Phase 17: NAT cleanup
 	s.natTable.Cleanup()
 
-	// Phase 16: UDP NAT cleanup
+	// Phase 18: UDP NAT cleanup
 	s.udpNAT.Cleanup(now)
 
 	// Print periodic debug stats (every ~1s)

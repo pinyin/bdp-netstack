@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,10 +76,23 @@ func setupE2E(t *testing.T, extraForwards ...string) *E2EEnv {
 	os.Chmod(localKeyPath, 0600)
 	privateKeyFile := localKeyPath
 
-	// Clean leftovers
+	// Clean leftovers and wait for resources to be released.
+	// Previous test runs or stale processes may still hold the socket or port.
 	os.Remove(sockPath)
 	efiStorePath := filepath.Join(os.TempDir(), "bdp-e2e-"+efiStore)
 	os.Remove(efiStorePath)
+
+	// Wait for the unix socket path to be fully released by any stale process.
+	for i := 0; i < 30; i++ {
+		if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Wait for the SSH port to be available. On macOS, ports can linger
+	// in TIME_WAIT after process termination, causing "address already in use".
+	waitPortFree(t, sshPort)
 
 	// Build binary
 	tmpDir, err := os.MkdirTemp("", "bdp-e2e")
@@ -255,19 +269,45 @@ func (e *E2EEnv) SSHCommand(cmd string) *exec.Cmd {
 }
 
 // Cleanup tears down the test environment.
+// Waits for processes to exit so ports are released before the next test starts.
 func (e *E2EEnv) Cleanup() {
 	e.t.Logf("Cleanup: killing processes...")
+	e.Cancel()
+
+	// Kill and wait for stack process so port 2223 is released
 	if e.StackCmd != nil && e.StackCmd.Process != nil {
 		e.StackCmd.Process.Kill()
+		// Wait up to 5 seconds for process to exit
+		done := make(chan struct{})
+		go func() {
+			e.StackCmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			e.t.Logf("stack process did not exit in time")
+		}
 	}
+
+	// Kill and wait for VM process
 	if e.VMCmd != nil && e.VMCmd.Process != nil {
 		e.VMCmd.Process.Kill()
+		done := make(chan struct{})
+		go func() {
+			e.VMCmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			e.t.Logf("VM process did not exit in time")
+		}
 	}
-	e.Cancel()
+
 	e.t.Logf("Logs preserved at: /tmp/bdp-e2e-test.log")
 	if e.TmpDir != "" {
 		e.t.Logf("Stack+vz-debug logs at: %s/", e.TmpDir)
-		// Keep tmpDir for post-mortem; OS cleans /tmp eventually
 	}
 }
 
@@ -386,6 +426,19 @@ func containsAll(s string, needles ...string) bool {
 		}
 	}
 	return true
+}
+
+// waitPortFree blocks until the TCP port is available or the test fails.
+func waitPortFree(t interface{ Fatal(...interface{}) }, port int) {
+	for i := 0; i < 50; i++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			ln.Close()
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("port", port, "still in use after 10 seconds")
 }
 
 func findProjectRoot() (string, error) {

@@ -23,7 +23,6 @@ type Entry struct {
 	// Host-side TCP connection
 	HostConn net.Conn
 	hostFD   int
-	hostBuf  []byte
 
 	// Pointer to the TCP connection in our stack (VM-facing side)
 	VMConn *tcp.Conn
@@ -35,9 +34,7 @@ type Entry struct {
 }
 
 // Table is the connection tracking table. All methods are called from
-// the same goroutine (BDP deliberation loop), so no locking is needed
-// for the entries map. However, host I/O uses a sync.Mutex for the
-// non-blocking reads from the same goroutine.
+// the same goroutine (BDP deliberation loop), so no locking is needed.
 type Table struct {
 	entries map[tcp.Tuple]*Entry
 
@@ -45,18 +42,26 @@ type Table struct {
 	pendingDials []*pendingDial
 
 	tcpState *tcp.TCPState // set during Intercept, used for AppClose
+	hostBuf  []byte        // shared read buffer, reused across all entries
+}
+
+type dialResult struct {
+	conn net.Conn
+	fd   int
+	err  error
 }
 
 type pendingDial struct {
 	Entry   *Entry
 	Seg     *tcp.TCPSegment
-	dialing chan struct{} // closed when dial completes
+	result  chan dialResult // receives dial result from async goroutine
 }
 
 // NewTable creates a new NAT connection tracking table.
 func NewTable() *Table {
 	return &Table{
 		entries: make(map[tcp.Tuple]*Entry),
+		hostBuf: make([]byte, 262144),
 	}
 }
 
@@ -79,7 +84,6 @@ func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
 			Key:     tuple,
 			ExtIP:   seg.Tuple.DstIPNet(),
 			ExtPort: seg.Tuple.DstPort,
-			hostBuf: make([]byte, 262144),
 		}
 
 		// Create the VM-facing TCP connection in our stack
@@ -101,18 +105,27 @@ func (t *Table) Intercept(seg *tcp.TCPSegment, tcpState *tcp.TCPState) bool {
 
 // PollDials processes pending host dials. Dials are started asynchronously
 // to avoid blocking the BDP deliberation loop on remote TCP connects.
-// Completed dials are detected via a channel and removed from the pending list.
+// Completed dial results are received via a channel and applied in the
+// deliberation goroutine, avoiding data races on entry fields.
 func (t *Table) PollDials() {
 	var remaining []*pendingDial
 	for _, pd := range t.pendingDials {
-		if pd.dialing == nil {
+		if pd.result == nil {
 			// Start a new async dial
 			t.doDial(pd)
 		}
 		// Check if dial has completed
 		select {
-		case <-pd.dialing:
-			// Dial completed (HostConn/hostFD set by goroutine)
+		case result := <-pd.result:
+			if result.err != nil {
+				log.Printf("NAT: dial %s failed: %v",
+					net.JoinHostPort(pd.Entry.ExtIP.String(), fmt.Sprintf("%d", pd.Entry.ExtPort)),
+					result.err)
+				pd.Entry.VMClosed = true
+			} else {
+				pd.Entry.HostConn = result.conn
+				pd.Entry.hostFD = result.fd
+			}
 		default:
 			remaining = append(remaining, pd)
 		}
@@ -162,7 +175,7 @@ func (t *Table) ProxyVMToHost() {
 func (t *Table) Cleanup() {
 	for key, entry := range t.entries {
 		// Derive VMClosed from TCP connection state
-		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.FinReceived {
+		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.IsFinReceived() {
 			entry.VMClosed = true
 		}
 		if entry.HostClosed && entry.VMClosed {
@@ -175,35 +188,31 @@ func (t *Table) Cleanup() {
 }
 
 // doDial starts an asynchronous host TCP connection.
-// The goroutine sets entry.HostConn and entry.hostFD on success,
-// or entry.VMClosed on failure. The dialing channel is closed when done.
+// Results are sent via the result channel and applied by PollDials in the
+// deliberation goroutine, avoiding data races on entry fields.
 func (t *Table) doDial(pd *pendingDial) {
-	pd.dialing = make(chan struct{})
-	entry := pd.Entry
-	addr := net.JoinHostPort(entry.ExtIP.String(), fmt.Sprintf("%d", entry.ExtPort))
+	pd.result = make(chan dialResult, 1)
+	addr := net.JoinHostPort(pd.Entry.ExtIP.String(), fmt.Sprintf("%d", pd.Entry.ExtPort))
 
 	go func() {
-		defer close(pd.dialing)
-
 		conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
 		if err != nil {
-			log.Printf("NAT: dial %s failed: %v", addr, err)
-			entry.VMClosed = true
+			pd.result <- dialResult{err: err}
 			return
 		}
 
-		entry.HostConn = conn
-
-		// Set non-blocking for BDP integration
+		fd := 0
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			rawConn, err := tcpConn.SyscallConn()
 			if err == nil {
-				rawConn.Control(func(fd uintptr) {
-					entry.hostFD = int(fd)
-					syscall.SetNonblock(entry.hostFD, true)
+				rawConn.Control(func(f uintptr) {
+					fd = int(f)
+					syscall.SetNonblock(fd, true)
 				})
 			}
 		}
+
+		pd.result <- dialResult{conn: conn, fd: fd}
 	}()
 }
 
@@ -223,7 +232,7 @@ func (t *Table) readHost(entry *Entry) {
 		return
 	}
 
-	buf := entry.hostBuf
+	buf := t.hostBuf
 	if space < len(buf) {
 		buf = buf[:space]
 	}

@@ -54,9 +54,9 @@ func New() (*Forwarder, error) {
 		return nil, fmt.Errorf("icmp listen: %w", err)
 	}
 
-	// Set short read deadline for non-blocking behavior
+	// Set read deadline to now for non-blocking behavior
 	rawConn := conn.IPv4PacketConn()
-	rawConn.SetReadDeadline(time.Now().Add(time.Millisecond))
+	rawConn.SetReadDeadline(time.Now().Add(100 * time.Microsecond))
 
 	return &Forwarder{
 		conn:    conn,
@@ -103,10 +103,8 @@ func (f *Forwarder) Forward(srcIP, dstIP net.IP, id, seq uint16, payload []byte)
 
 // Poll reads available ICMP replies (non-blocking). Called during deliberation.
 func (f *Forwarder) Poll() {
-	// Reset read deadline for this round. The deadline is an absolute time;
-	// without this reset, a past deadline causes every ReadFrom to return
-	// immediately with a timeout, making the forwarder non-functional.
-	f.rawConn.SetReadDeadline(time.Now().Add(time.Millisecond))
+	// Reset read deadline for this round.
+	f.rawConn.SetReadDeadline(time.Now())
 
 	buf := make([]byte, 1500)
 	for {

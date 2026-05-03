@@ -76,6 +76,7 @@ func setupPipe(t *testing.T, bufSize int) (*Forwarder, *Entry, *tcp.TCPState, *t
 		listeners: make(map[uint16]net.Listener),
 		entries:   make(map[int]*Entry),
 		tcpState:  tcpState,
+		hostBuf:   make([]byte, 262144),
 	}
 
 	entry := &Entry{
@@ -83,7 +84,6 @@ func setupPipe(t *testing.T, bufSize int) (*Forwarder, *Entry, *tcp.TCPState, *t
 		hostFD:   hostFD,
 		VMConn:   vmConn,
 		VMAddr:   "192.168.65.2:22",
-		hostBuf:  make([]byte, 65536),
 	}
 	f.entries[hostFD] = entry
 
@@ -253,7 +253,6 @@ func TestIntegration_MultipleConnections(t *testing.T) {
 		hostFD:   hostFD2,
 		VMConn:   c2,
 		VMAddr:   "192.168.65.2:22",
-		hostBuf:  make([]byte, 65536),
 	}
 	f.entries[hostFD2] = e2
 

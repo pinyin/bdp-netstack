@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/udp"
 )
@@ -78,15 +79,26 @@ func TestServfail(t *testing.T) {
 		Payload: query,
 	}
 
-	// This should return a SERVFAIL (upstream unreachable)
-	responses := p.Handler()(dg)
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response (SERVFAIL), got %d", len(responses))
+	// Async handler enqueues query, returns nil
+	handler := p.Handler()
+	responses := handler(dg)
+	if len(responses) != 0 {
+		t.Fatalf("expected 0 immediate responses (async), got %d", len(responses))
 	}
-	if string(responses[0].Payload) == string(query) {
+
+	// Wait for the async goroutine to fail (dial to 127.0.0.1:53 should fail fast)
+	time.Sleep(50 * time.Millisecond)
+
+	// Poll picks up the failed resolution and generates SERVFAIL
+	p.Poll()
+	ready := p.ConsumeResponses()
+	if len(ready) != 1 {
+		t.Fatalf("expected 1 response (SERVFAIL) after Poll, got %d", len(ready))
+	}
+	if string(ready[0].Payload) == string(query) {
 		t.Fatal("expected different response from query")
 	}
-	t.Log("SERVFAIL response generated for unreachable upstream")
+	t.Log("SERVFAIL response generated for unreachable upstream (async)")
 }
 
 func TestBuildServfail(t *testing.T) {

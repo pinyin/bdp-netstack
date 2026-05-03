@@ -1,4 +1,5 @@
 // Package dns implements a minimal DNS proxy integrated into the BDP UDP layer.
+// Upstream resolution is asynchronous to avoid blocking the BDP deliberation loop.
 package dns
 
 import (
@@ -7,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pinyin/bdp-netstack/pkg/udp"
@@ -16,17 +18,34 @@ const (
 	DNSPort = 53
 )
 
-// Proxy is a BDP-style DNS forwarder. It receives DNS queries on UDP port 53
-// and forwards them to an upstream DNS server.
+// pendingQuery tracks an in-flight DNS query to upstream.
+type pendingQuery struct {
+	srcIP   net.IP
+	dstIP   net.IP
+	srcPort uint16
+	dstPort uint16
+	query   []byte // original DNS query (for SERVFAIL on failure)
+	result  chan *udp.UDPDatagram
+}
+
+// Proxy is a BDP-style DNS forwarder. It enqueues DNS queries and resolves
+// them asynchronously via goroutines, then surfaces responses via Poll().
 type Proxy struct {
 	upstream string // "ip:port" of upstream DNS
 	listenIP net.IP
+
+	nextID  uint64
+	pending map[uint64]*pendingQuery
+	ready   []*udp.UDPDatagram
 }
 
 // NewProxy creates a DNS proxy. upstreamAddr is the upstream DNS server (e.g., "8.8.8.8:53").
 // If empty, reads from /etc/resolv.conf.
 func NewProxy(listenIP net.IP, upstreamAddr string) *Proxy {
-	p := &Proxy{listenIP: listenIP}
+	p := &Proxy{
+		listenIP: listenIP,
+		pending:  make(map[uint64]*pendingQuery),
+	}
 	if upstreamAddr != "" {
 		p.upstream = upstreamAddr
 	} else {
@@ -36,56 +55,115 @@ func NewProxy(listenIP net.IP, upstreamAddr string) *Proxy {
 }
 
 // Handler returns a udp.Handler for BDP integration.
+// Queries are enqueued for async resolution; responses are delivered via Poll().
 func (p *Proxy) Handler() udp.Handler {
 	return func(dg *udp.UDPDatagram) []*udp.UDPDatagram {
-		resp := p.forward(dg)
-		if resp == nil {
-			return nil
-		}
-		return []*udp.UDPDatagram{resp}
+		p.enqueue(dg)
+		return nil // response delivered asynchronously via Poll()
 	}
 }
 
-// forward sends a DNS query to upstream and returns the response.
-func (p *Proxy) forward(dg *udp.UDPDatagram) *udp.UDPDatagram {
+// enqueue adds a DNS query to the pending table and starts async resolution.
+// The goroutine captures the result channel directly to avoid any data race
+// on the pending map.
+func (p *Proxy) enqueue(dg *udp.UDPDatagram) {
 	if p.upstream == "" {
-		return p.servfail(dg)
+		resp := p.servfail(dg)
+		if resp != nil {
+			p.ready = append(p.ready, resp)
+		}
+		return
 	}
 
-	conn, err := net.DialTimeout("udp", p.upstream, 2*time.Second)
-	if err != nil {
-		return p.servfail(dg)
+	id := atomic.AddUint64(&p.nextID, 1)
+	pq := &pendingQuery{
+		srcIP:   dg.SrcIP,
+		dstIP:   dg.DstIP,
+		srcPort: dg.SrcPort,
+		dstPort: dg.DstPort,
+		query:   dg.Payload,
+		result:  make(chan *udp.UDPDatagram, 1),
 	}
-	defer conn.Close()
+	p.pending[id] = pq
 
-	if _, err := conn.Write(dg.Payload); err != nil {
-		return p.servfail(dg)
-	}
+	// Capture everything the goroutine needs, including the channel.
+	// No map access from the goroutine — channel send is the only communication.
+	upstream := p.upstream
+	query := dg.Payload
+	ch := pq.result
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	respBuf := make([]byte, 1500)
-	n, err := conn.Read(respBuf)
-	if err != nil {
-		return p.servfail(dg)
-	}
+	go func() {
+		conn, err := net.DialTimeout("udp", upstream, 2*time.Second)
+		if err != nil {
+			ch <- nil
+			return
+		}
+		defer conn.Close()
 
-	return &udp.UDPDatagram{
-		SrcIP:   dg.DstIP,
-		DstIP:   dg.SrcIP,
-		SrcPort: DNSPort,
-		DstPort: dg.SrcPort,
-		Payload: respBuf[:n],
+		if _, err := conn.Write(query); err != nil {
+			ch <- nil
+			return
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		respBuf := make([]byte, 1500)
+		n, err := conn.Read(respBuf)
+		if err != nil {
+			ch <- nil
+			return
+		}
+
+		// Build response datagram with correct addresses
+		resp := &udp.UDPDatagram{
+			SrcIP:   pq.dstIP,
+			DstIP:   pq.srcIP,
+			SrcPort: DNSPort,
+			DstPort: pq.srcPort,
+			Payload: respBuf[:n],
+		}
+		ch <- resp
+	}()
+}
+
+// Poll checks for completed DNS resolutions and enqueues responses for delivery.
+// Called from the BDP deliberation loop (single goroutine).
+func (p *Proxy) Poll() {
+	for id, pq := range p.pending {
+		select {
+		case resp := <-pq.result:
+			if resp != nil {
+				p.ready = append(p.ready, resp)
+			} else {
+				// Resolution failed; return SERVFAIL so the VM gets a response
+				sf := p.servfail(&udp.UDPDatagram{
+					SrcIP: pq.srcIP, DstIP: pq.dstIP,
+					SrcPort: pq.srcPort, DstPort: pq.dstPort,
+					Payload: pq.query,
+				})
+				if sf != nil {
+					p.ready = append(p.ready, sf)
+				}
+			}
+			delete(p.pending, id)
+		default:
+		}
 	}
 }
 
-// servfail returns a SERVFAIL response for failed queries.
+// ConsumeResponses returns and clears accumulated DNS responses.
+func (p *Proxy) ConsumeResponses() []*udp.UDPDatagram {
+	out := p.ready
+	p.ready = nil
+	return out
+}
+
+// servfail returns a SERVFAIL response for a failed query (synchronous fallback).
 func (p *Proxy) servfail(dg *udp.UDPDatagram) *udp.UDPDatagram {
 	if len(dg.Payload) < 2 {
 		return nil
 	}
 	resp := make([]byte, len(dg.Payload))
 	copy(resp, dg.Payload)
-	// Copy transaction ID, set response + SERVFAIL flags
 	if len(resp) >= 4 {
 		resp[2] = 0x81 // QR=1 (response), Opcode=0, AA=0, TC=0, RD=0
 		resp[3] = 0x82 // RA=0, Z=0, RCODE=2 (SERVFAIL)
@@ -110,7 +188,6 @@ func readSystemDNS() string {
 		if strings.HasPrefix(line, "nameserver ") {
 			ip := strings.TrimPrefix(line, "nameserver ")
 			ip = strings.TrimSpace(ip)
-			// Validate IP
 			if net.ParseIP(ip) != nil {
 				return net.JoinHostPort(ip, "53")
 			}
@@ -139,8 +216,6 @@ func (p *Proxy) Upstream() string {
 	return p.upstream
 }
 
-// Test helpers
-
 // ParseQueryName extracts the QNAME from a DNS query (for testing).
 func ParseQueryName(data []byte) (string, int, error) {
 	if len(data) < 12 {
@@ -158,7 +233,6 @@ func ParseQueryName(data []byte) (string, int, error) {
 			break
 		}
 		if l&0xC0 != 0 {
-			// Compressed name — not handled in this minimal parser
 			offset += 2
 			break
 		}

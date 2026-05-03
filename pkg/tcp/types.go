@@ -225,6 +225,12 @@ func NewConn(tuple Tuple, irs uint32, iss uint32, window uint16, bufSize int) *C
 // RecvAvail returns the number of bytes available to read.
 func (c *Conn) RecvAvail() int { return c.recvSize }
 
+// IsFinReceived returns true if the peer has sent a FIN on this connection.
+func (c *Conn) IsFinReceived() bool { return c.FinReceived }
+
+// IsFinSent returns true if we have sent a FIN on this connection.
+func (c *Conn) IsFinSent() bool { return c.FinSent }
+
 // RecvWritable returns how many bytes can still be written to RecvBuf.
 func (c *Conn) RecvWritable() int {
 	return len(c.RecvBuf) - c.recvSize

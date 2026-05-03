@@ -21,7 +21,6 @@ type Entry struct {
 	hostFD        int
 	VMConn        *tcp.Conn
 	VMAddr        string // "ip:port" for logging
-	hostBuf       []byte // pre-allocated read buffer
 	HostClosed    bool
 	VMClosed      bool
 	deferredClose bool // host EOF seen but send buffer not yet drained
@@ -35,6 +34,7 @@ type Forwarder struct {
 	entries   map[int]*Entry
 	nextPort  uint32 // atomic counter for unique ephemeral source ports
 	tcpState  *tcp.TCPState
+	hostBuf   []byte // shared read buffer, reused across all entries
 }
 
 func (f *Forwarder) Listeners() map[uint16]net.Listener { return f.listeners }
@@ -54,6 +54,7 @@ func New(gatewayIP net.IP, mappings []Mapping) (*Forwarder, error) {
 		mappings:  make(map[uint16]Mapping),
 		listeners: make(map[uint16]net.Listener),
 		entries:   make(map[int]*Entry),
+		hostBuf:   make([]byte, 262144),
 	}
 
 	for _, m := range mappings {
@@ -77,7 +78,7 @@ func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
 	for hostPort, ln := range f.listeners {
 		for {
 			if tl, ok := ln.(*net.TCPListener); ok {
-				tl.SetDeadline(time.Now().Add(time.Millisecond))
+				tl.SetDeadline(time.Now().Add(100 * time.Microsecond))
 			}
 			conn, err := ln.Accept()
 			if err != nil {
@@ -111,7 +112,6 @@ func (f *Forwarder) PollAccept(tcpState *tcp.TCPState) {
 				hostFD:   fd,
 				VMConn:   vmConn,
 				VMAddr:   vmAddr,
-				hostBuf:  make([]byte, 262144),
 			}
 
 			log.Printf("Forwarder: new connection :%d → %s", hostPort, vmAddr)
@@ -167,7 +167,7 @@ func (f *Forwarder) Cleanup() {
 		// - If VMConn is nil, the connection was never fully established
 		// - If connection was removed from all TCP states (e.g., AppClose
 		//   removed it from SynSent/SynRcvd), treat as VMClosed.
-		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.FinReceived {
+		if !entry.VMClosed && entry.VMConn != nil && entry.VMConn.IsFinReceived() {
 			entry.VMClosed = true
 		}
 		if !entry.VMClosed && entry.VMConn != nil && entry.HostClosed && f.tcpState != nil {
@@ -239,7 +239,7 @@ func (f *Forwarder) readHost(entry *Entry) {
 		return
 	}
 
-	buf := entry.hostBuf
+	buf := f.hostBuf
 	if space < len(buf) {
 		buf = buf[:space]
 	}

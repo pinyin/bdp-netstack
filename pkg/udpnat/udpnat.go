@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 	"syscall"
 	"time"
 
@@ -59,7 +58,6 @@ type Entry struct {
 // All methods are called from the BDP deliberation loop (single goroutine).
 type Table struct {
 	entries map[Key]*Entry
-	mu      sync.Mutex // protects host I/O edge cases
 }
 
 // NewTable creates a new UDP NAT table.

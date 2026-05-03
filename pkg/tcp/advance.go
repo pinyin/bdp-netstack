@@ -321,6 +321,9 @@ func (ts *TCPState) advanceEstablished() {
 			if seg.Header.IsACK() {
 				if seqGT(seg.Header.AckNum, conn.SND_UNA) {
 					conn.AckSendBuf(seg.Header.AckNum)
+					if seqGT(conn.SND_UNA, conn.SND_NXT) {
+						conn.SND_NXT = conn.SND_UNA
+					}
 				}
 				// Update window even for pure window updates (AckNum == SND_UNA)
 				if seqGE(seg.Header.AckNum, conn.SND_UNA) {
@@ -386,6 +389,9 @@ func (ts *TCPState) advanceCloseWait() {
 			if seg.Header.IsACK() {
 				if seqGT(seg.Header.AckNum, conn.SND_UNA) {
 					conn.AckSendBuf(seg.Header.AckNum)
+						if seqGT(conn.SND_UNA, conn.SND_NXT) {
+							conn.SND_NXT = conn.SND_UNA
+						}
 				}
 				if seqGE(seg.Header.AckNum, conn.SND_UNA) {
 					conn.SND_WND = uint32(seg.Header.WindowSize) << conn.SndShift
@@ -423,6 +429,9 @@ func (ts *TCPState) advanceLastAck() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() && seqGT(seg.Header.AckNum, conn.SND_UNA) {
 				conn.AckSendBuf(seg.Header.AckNum)
+					if seqGT(conn.SND_UNA, conn.SND_NXT) {
+						conn.SND_NXT = conn.SND_UNA
+					}
 				// Check if ACK covers our FIN
 				if seqGE(seg.Header.AckNum, conn.SND_NXT) {
 					acked = true
@@ -462,6 +471,9 @@ func (ts *TCPState) advanceFinWait1() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
+					if seqGT(conn.SND_UNA, conn.SND_NXT) {
+						conn.SND_NXT = conn.SND_UNA
+					}
 				// Our FIN was acked if the ACK covers our FIN seq = ISS+1+dataSent
 				if conn.FinSent && seqGE(seg.Header.AckNum, conn.SND_NXT) {
 					hasAckOfFin = true
@@ -530,6 +542,9 @@ func (ts *TCPState) advanceFinWait2() {
 		for _, seg := range conn.PendingSegs {
 			if seg.Header.IsACK() {
 				conn.AckSendBuf(seg.Header.AckNum)
+					if seqGT(conn.SND_UNA, conn.SND_NXT) {
+						conn.SND_NXT = conn.SND_UNA
+					}
 			}
 			if seg.Header.IsFIN() {
 				conn.FinReceived = true
